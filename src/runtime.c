@@ -67,7 +67,7 @@ static void apply_static_specs(void) {
         if (s->kind == TW_SPEC_SYMBOL) {
             uint64_t size = 0;
             if (!tw_sym_find(s->image, s->name, &addr, &size)) {
-                tw_log("cannot watch symbol '%s': not found in %s", s->name, s->image[0] ? s->image : "the main executable");
+                tw_warn("cannot watch symbol '%s': not found in %s", s->name, s->image[0] ? s->image : "the main executable");
                 continue;
             }
             addr += s->off;
@@ -79,7 +79,7 @@ static void apply_static_specs(void) {
         tagwatch_id id = rc == 0 ? tw_watch_add(addr, len, label, s->mode,
                                                 s->kind == TW_SPEC_SYMBOL ? TW_ORIGIN_SYMBOL : TW_ORIGIN_ADDR, NULL, 0)
                                  : rc;
-        if (id < 0) tw_log("cannot watch %s at %llx: %s", label[0] ? label : "range", (unsigned long long)addr, tagwatch_strerror((int)id));
+        if (id < 0) tw_warn("cannot watch %s at 0x%llx: %s", label[0] ? label : "range", (unsigned long long)addr, tagwatch_strerror((int)id));
     }
 }
 
@@ -141,7 +141,7 @@ static int init_once(void) {
     if (watch) {
         char err[160];
         int n = tw_spec_parse_list(watch, tw_rt.specs, (int)(sizeof tw_rt.specs / sizeof tw_rt.specs[0]), err, sizeof err);
-        if (n < 0) tw_log("ignoring TAGWATCH_WATCH: %s", err);
+        if (n < 0) tw_warn("ignoring TAGWATCH_WATCH: %s", err);
         else tw_rt.nspecs = n;
     }
 
@@ -203,7 +203,7 @@ __attribute__((constructor)) static void tw_constructor(void) {
     if (!getenv("TAGWATCH_AUTO")) return;
     int rc = tagwatch_init();
     if (rc != 0) {
-        tw_log("not tracing this process: %s", tagwatch_strerror(rc));
+        tw_warn("not tracing this process: %s", tagwatch_strerror(rc));
         scrub_environment();
     }
 }

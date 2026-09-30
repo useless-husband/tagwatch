@@ -379,7 +379,7 @@ void tw_emit_violation(uint64_t addr, uint64_t pc, uint64_t tid, unsigned access
     }
 }
 
-void tw_emit_note(const char *kind, const char *msg) {
+static void emit_note(const char *kind, const char *msg, int to_log) {
     char s[512];
     tw_buf b;
     if (trace_fd >= 0) {
@@ -393,13 +393,33 @@ void tw_emit_note(const char *kind, const char *msg) {
         tw_put_str(&b, "}\n");
         flush(trace_fd, &b);
     }
-    if (log_fd >= 0) {
+    if (to_log && log_fd >= 0) {
         tw_buf_init(&b, s, sizeof s);
         tw_put_str(&b, "tagwatch: ");
         tw_put_str(&b, msg);
         tw_put_char(&b, '\n');
         flush(log_fd, &b);
     }
+}
+
+void tw_emit_note(const char *kind, const char *msg) { emit_note(kind, msg, 1); }
+
+// Problems the user must see even when the live log is off: always on
+// stderr, and recorded in the trace so the summary repeats them.
+void tw_warn(const char *fmt, ...) {
+    char msg[400], line[512];
+    tw_buf b;
+    tw_buf_init(&b, msg, sizeof msg);
+    va_list ap;
+    va_start(ap, fmt);
+    tw_put_vfmt(&b, fmt, ap);
+    va_end(ap);
+    emit_note("warning", msg, 0);
+    tw_buf_init(&b, line, sizeof line);
+    tw_put_str(&b, "tagwatch: ");
+    tw_put_str(&b, msg);
+    tw_put_char(&b, '\n');
+    flush(2, &b);
 }
 
 void tw_emit_stats(void) {

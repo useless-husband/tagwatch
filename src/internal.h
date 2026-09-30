@@ -123,6 +123,7 @@ void tw_emit_violation(uint64_t addr, uint64_t pc, uint64_t tid, unsigned access
 void tw_emit_note(const char *kind, const char *msg);
 void tw_emit_stats(void);
 void tw_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void tw_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint64_t tw_now_ns(void);
 
 // ---- exc.c: the exception thread ------------------------------------------------
