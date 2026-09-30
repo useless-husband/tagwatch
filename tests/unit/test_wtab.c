@@ -20,9 +20,17 @@ static const tw_mem mem = {t_alloc, t_release};
 
 // Reference model: one slot per granule over a small address window that
 // straddles many page boundaries.
-#define WINDOW_GRANULES 8192
+#define WINDOW_GRANULES 65536 // 64 pages: enough for the bucket table to grow
 static uint32_t model[WINDOW_GRANULES];
 #define BASE 0x100ffc000ull
+
+static uint64_t seen_addr[8];
+static unsigned seen_tag[8], n_seen;
+static void collect(uint64_t addr, unsigned tag, void *ctx) {
+    (void)ctx;
+    if (n_seen < 8) seen_addr[n_seen] = addr, seen_tag[n_seen] = tag;
+    n_seen++;
+}
 
 static void basic(void) {
     tw_wtab t;
@@ -38,6 +46,16 @@ static void basic(void) {
     CHECK(tw_wtab_get(&t, 0x1018, &tag) == 7 && tag == 0xa);
     tw_wtab_set_orig_tag(&t, 0x2000, 0x5); // not armed: ignored
     CHECK(tw_wtab_get(&t, 0x2000, &tag) == 0);
+
+    // Only granules whose original tag was recorded count as armed.
+    tw_wtab_foreach_armed(&t, collect, NULL);
+    CHECK_EQ(n_seen, 1);
+    CHECK(seen_addr[0] == 0x1010 && seen_tag[0] == 0xa);
+    tw_wtab_set_orig_tag(&t, 0x1020, 0); // armed with original tag 0: distinct from "not armed yet"
+    n_seen = 0;
+    tw_wtab_foreach_armed(&t, collect, NULL);
+    CHECK_EQ(n_seen, 2);
+    CHECK(tw_wtab_get(&t, 0x1020, &tag) == 7 && tag == 0);
 
     // Overlap is rejected and leaves the table untouched.
     CHECK(tw_wtab_insert(&t, 0x1020, 32, 8) == -EEXIST);
@@ -96,6 +114,18 @@ static void oom(void) {
     }
 }
 
+// Armed granules seen by tw_wtab_foreach_armed, for comparison with the model.
+static uint8_t seen_armed[WINDOW_GRANULES]; // 0 = not seen, else tag + 1
+static unsigned seen_outside;
+static void collect_armed(uint64_t addr, unsigned tag, void *ctx) {
+    (void)ctx;
+    if (addr < BASE || addr >= BASE + WINDOW_GRANULES * 16ull) {
+        seen_outside++;
+        return;
+    }
+    seen_armed[(addr - BASE) / 16] = (uint8_t)(tag + 1);
+}
+
 static void randomized(void) {
     uint64_t st = t_seed(0x7774616221212121ull);
     tw_wtab t;
@@ -104,21 +134,31 @@ static void randomized(void) {
         uint32_t first, count;
         int live;
     } watches[600];
+    static uint8_t model_armed[WINDOW_GRANULES]; // 0 = not armed, else tag + 1
     memset(watches, 0, sizeof watches);
     uint64_t total = 0;
+    size_t max_cap = 0;
     for (int step = 0; step < 60000; step++) {
         uint32_t w = (uint32_t)(t_rand(&st) % 600);
         if (!watches[w].live) {
             uint32_t first = (uint32_t)(t_rand(&st) % WINDOW_GRANULES);
             // Mostly small objects, sometimes multi-page ranges.
-            uint32_t count = (t_rand(&st) % 16 == 0) ? 1 + (uint32_t)(t_rand(&st) % 2500) : 1 + (uint32_t)(t_rand(&st) % 8);
+            uint32_t count = (t_rand(&st) % 16 == 0) ? 1 + (uint32_t)(t_rand(&st) % 5000) : 1 + (uint32_t)(t_rand(&st) % 8);
             if (first + count > WINDOW_GRANULES) count = WINDOW_GRANULES - first;
             int overlap = 0;
             for (uint32_t g = first; g < first + count; g++) overlap |= model[g] != 0;
             int rc = tw_wtab_insert(&t, BASE + first * 16ull, count * 16ull, w + 1);
             CHECK_EQ(rc, overlap ? -EEXIST : 0);
             if (rc == 0) {
-                for (uint32_t g = first; g < first + count; g++) model[g] = w + 1;
+                for (uint32_t g = first; g < first + count; g++) {
+                    model[g] = w + 1;
+                    // Arm most granules, as watch.c does, with a random original tag.
+                    if (t_rand(&st) % 8) {
+                        unsigned tag = (unsigned)(t_rand(&st) & 15);
+                        tw_wtab_set_orig_tag(&t, BASE + g * 16ull, tag);
+                        model_armed[g] = (uint8_t)(tag + 1);
+                    }
+                }
                 watches[w].first = first;
                 watches[w].count = count;
                 watches[w].live = 1;
@@ -127,11 +167,22 @@ static void randomized(void) {
         } else {
             uint64_t n = tw_wtab_remove(&t, BASE + watches[w].first * 16ull, watches[w].count * 16ull, w + 1);
             CHECK_EQ(n, watches[w].count);
-            for (uint32_t g = watches[w].first; g < watches[w].first + watches[w].count; g++) model[g] = 0;
+            for (uint32_t g = watches[w].first; g < watches[w].first + watches[w].count; g++) model[g] = 0, model_armed[g] = 0;
             watches[w].live = 0;
             total -= watches[w].count;
         }
         CHECK(t.granules == total);
+        if (tw_wtab_capacity(&t) > max_cap) max_cap = tw_wtab_capacity(&t);
+        // The armed set, as the fork child would enumerate it, matches the model.
+        if (step % 500 == 0) {
+            memset(seen_armed, 0, sizeof seen_armed);
+            seen_outside = 0;
+            tw_wtab_foreach_armed(&t, collect_armed, NULL);
+            CHECK_EQ(seen_outside, 0);
+            int mismatches = 0;
+            for (uint32_t g = 0; g < WINDOW_GRANULES; g++) mismatches += seen_armed[g] != model_armed[g];
+            CHECK_EQ(mismatches, 0);
+        }
         // Point queries.
         for (int q = 0; q < 8; q++) {
             uint32_t g = (uint32_t)(t_rand(&st) % WINDOW_GRANULES);
@@ -155,9 +206,13 @@ static void randomized(void) {
     }
     // Full sweep at the end, then drain and check the table empties itself.
     for (uint32_t g = 0; g < WINDOW_GRANULES; g++) CHECK(tw_wtab_get(&t, BASE + g * 16ull, NULL) == model[g]);
+    CHECK(max_cap > 64); // the bucket table grew at least once during the run
     for (int w = 0; w < 600; w++)
         if (watches[w].live) tw_wtab_remove(&t, BASE + watches[w].first * 16ull, watches[w].count * 16ull, (uint32_t)w + 1);
     CHECK(t.granules == 0 && t.used == 0);
+    n_seen = 0;
+    tw_wtab_foreach_armed(&t, collect, NULL);
+    CHECK_EQ(n_seen, 0);
     tw_wtab_destroy(&t);
     CHECK_EQ(live_bytes, 0);
 }

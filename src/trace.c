@@ -103,6 +103,19 @@ static void put_frame_text(tw_buf *b, uint64_t pc, int is_return_address) {
     }
 }
 
+// Symbol names can be very long (C++, Swift); keep records bounded.
+static void put_name_json(tw_buf *b, const char *name) {
+    char cut[260];
+    size_t n = strlen(name);
+    if (n < sizeof cut - 4) {
+        tw_put_json_str(b, name);
+        return;
+    }
+    memcpy(cut, name, sizeof cut - 4);
+    memcpy(cut + sizeof cut - 4, "...", 4);
+    tw_put_json_str(b, cut);
+}
+
 static void put_frames_json(tw_buf *b, const uint64_t *frames, unsigned n) {
     tw_put_str(b, "\"bt\":[");
     for (unsigned i = 0; i < n; i++) {
@@ -114,7 +127,7 @@ static void put_frames_json(tw_buf *b, const uint64_t *frames, unsigned n) {
         if (tw_sym_lookup(i ? frames[i] - 1 : frames[i], &s)) {
             if (s.name) {
                 tw_put_str(b, ",\"sym\":");
-                tw_put_json_str(b, s.name);
+                put_name_json(b, s.name);
                 tw_put_str(b, ",\"off\":");
                 tw_put_dec(b, frames[i] - s.addr);
             }
@@ -271,7 +284,10 @@ void tw_emit_access(const tagwatch_event *ev) {
     char s[8192];
     tw_buf b;
     const char *kind = tw_access_name(ev->access);
-    if (trace_fd >= 0) {
+    // A record that does not fit is written again with half the frames
+    // rather than dropped: losing an access from the trace is worse than
+    // losing the outer part of its backtrace.
+    for (unsigned nframes = ev->nframes; trace_fd >= 0; nframes /= 2) {
         tw_buf_init(&b, s, sizeof s);
         tw_put_str(&b, "{\"ev\":\"access\",\"seq\":");
         tw_put_dec(&b, ev->seq);
@@ -284,7 +300,7 @@ void tw_emit_access(const tagwatch_event *ev) {
         tw_put_str(&b, ",\"addr\":\"");
         tw_put_hex(&b, ev->addr);
         tw_put_str(&b, "\",\"watch\":");
-        tw_put_sdec(&b, ev->watch);
+        tw_put_dec(&b, ev->watch_serial);
         tw_put_str(&b, ",\"off\":");
         tw_put_sdec(&b, ev->offset);
         tw_put_str(&b, ",\"tid\":");
@@ -296,9 +312,12 @@ void tw_emit_access(const tagwatch_event *ev) {
             tw_put_json_str(&b, ev->syscall);
         }
         tw_put_char(&b, ',');
-        put_frames_json(&b, ev->frames, ev->nframes);
+        put_frames_json(&b, ev->frames, nframes);
         tw_put_str(&b, "}\n");
-        if (!b.truncated) flush(trace_fd, &b);
+        if (!b.truncated || nframes == 0) {
+            if (!b.truncated) flush(trace_fd, &b);
+            break;
+        }
     }
     if (log_fd >= 0) {
         tw_buf_init(&b, s, sizeof s);
@@ -311,7 +330,7 @@ void tw_emit_access(const tagwatch_event *ev) {
         tw_put_str(&b, ev->size == 1 ? " byte  at " : " bytes at ");
         tw_put_hex(&b, ev->addr);
         tw_put_str(&b, "  watch #");
-        tw_put_sdec(&b, ev->watch);
+        tw_put_dec(&b, ev->watch_serial);
         if (ev->label && ev->label[0]) {
             tw_put_str(&b, " \"");
             tw_put_str(&b, ev->label);

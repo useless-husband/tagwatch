@@ -61,6 +61,7 @@ int main(void) {
     store8(h + 5, 1);
     CHECK_EQ(mt_count(), 1);
     CHECK(mt_last()->access == TAGWATCH_WRITE && mt_last()->size == 1 && mt_last()->offset == 5);
+    CHECK(mt_last()->watch == id); // the callback sees the id the caller was given
     CHECK(tagwatch_watch(h + 16, 16, "overlap") == -TAGWATCH_EEXIST);
     CHECK(tagwatch_unwatch(id) == 0);
     CHECK(tagwatch_unwatch(id) == -TAGWATCH_ENOENT);

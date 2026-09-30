@@ -55,6 +55,12 @@ static int n_pools;
 static map_t *map;
 static size_t map_cap, map_used;
 static int force_far; // TAGWATCH_FORCE_FAR=1: always return through BRK (tests, benchmarks)
+// Neighbourhoods (64 MB buckets) where the search for nearby free address
+// space already failed; searching again for every new pc there would cost
+// thousands of system calls each time.
+#define HOPELESS_MAX 128
+static uint64_t hopeless[HOPELESS_MAX];
+static int n_hopeless;
 
 static size_t map_bucket(uint64_t pc) { return (size_t)(((pc >> 2) * 0x9e3779b97f4a7c15ull) >> 32) & (map_cap - 1); }
 
@@ -108,7 +114,9 @@ static pool_t *add_pool(uint64_t base) {
 // Finds unmapped address space within branch range of pc and maps a pool
 // there. The kernel treats the mmap address as a hint, so verify the result.
 static pool_t *new_pool_near(uint64_t pc) {
-    uint64_t lo = pc > REACH ? (pc - REACH) & ~(TW_PAGE_SIZE - 1) : TW_PAGE_SIZE;
+    // Round the lower bound up: a pool starting one page below pc - REACH
+    // would fail the distance check below and lose the whole first gap.
+    uint64_t lo = pc > REACH ? ((pc - REACH) & ~(TW_PAGE_SIZE - 1)) + TW_PAGE_SIZE : TW_PAGE_SIZE;
     uint64_t hi = pc + REACH - POOL_BYTES;
     mach_vm_address_t addr = lo;
     for (int tries = 0; tries < 4096 && addr < hi; tries++) {
@@ -141,7 +149,12 @@ static pool_t *pool_near(uint64_t pc) {
     for (int i = 0; i < n_pools; i++)
         if (pools[i].used < POOL_SLOTS && distance(pools[i].base, pc) < REACH && distance(pools[i].base + POOL_BYTES, pc) < REACH)
             return &pools[i];
-    return new_pool_near(pc);
+    uint64_t bucket = pc >> 26;
+    for (int i = 0; i < n_hopeless; i++)
+        if (hopeless[i] == bucket) return NULL;
+    pool_t *p = new_pool_near(pc);
+    if (!p && n_hopeless < HOPELESS_MAX) hopeless[n_hopeless++] = bucket;
+    return p;
 }
 
 static pool_t *pool_any(void) {

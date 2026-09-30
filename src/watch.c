@@ -9,6 +9,7 @@
 // touching program memory through ordinary (tag-checked) accesses, so the
 // thread holding it cannot take a watch fault and deadlock the handler.
 #include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -16,8 +17,15 @@
 
 #define CHUNK 1024
 #define MAX_CHUNKS 4096 // 4.2 million simultaneous watches
+#define ID_SHIFT 27     // public id = serial << ID_SHIFT | slot
 
 static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+// The thread that is inside fork() and holds the lock for its duration (see
+// tw_watch_before_fork). Its own calls in that window must not take the
+// lock again: libSystem's fork handlers call free() (and so the free
+// interposer) on that thread, in the child, before tagwatch's own handler
+// has run. Such calls see an empty table.
+static _Atomic(pthread_t) fork_thread;
 static tw_wtab table;
 static tw_watch *chunks[MAX_CHUNKS];
 static uint32_t n_slots = 1; // slot 0 is "no watch"
@@ -26,8 +34,14 @@ static uint64_t next_serial = 1;
 static uint64_t live_watches, total_watches;
 _Atomic uint64_t tw_armed_granules;
 _Atomic uint64_t tw_watch_generation;
+_Atomic uint64_t tw_inplace_watches; // live watches on memory outside the arena
 
 static tw_watch *slot_ptr(uint32_t slot) { return &chunks[slot / CHUNK][slot % CHUNK]; }
+
+static inline int in_own_fork(void) {
+    pthread_t t = atomic_load_explicit(&fork_thread, memory_order_relaxed);
+    return t != NULL && pthread_equal(t, pthread_self());
+}
 
 static uint32_t slot_alloc(void) {
     if (free_head) {
@@ -50,18 +64,20 @@ static void slot_free(uint32_t s) {
     free_head = s;
 }
 
-// Public ids carry the slot in the low 28 bits and the serial above, so a
-// stale id can be told apart from the slot's next tenant.
-static tagwatch_id make_id(uint32_t slot, uint64_t serial) { return (tagwatch_id)((serial << 28) | slot); }
+// Public ids carry the slot in the low bits and the serial above, so a stale
+// id can be told apart from the slot's next tenant.
+static tagwatch_id make_id(uint32_t slot, uint64_t serial) { return (tagwatch_id)((serial << ID_SHIFT) | slot); }
 
 int tw_watch_module_init(void) { return tw_wtab_init(&table, &tw_vm_mem); }
 
 static void disarm_locked(uint32_t slot) {
     tw_watch *w = slot_ptr(slot);
+    // Guarded stores: the program may have unmapped the memory meanwhile.
     for (uint64_t a = w->gbase; a != w->gbase + w->glen; a += TW_GRANULE) {
         unsigned orig;
-        if (tw_wtab_get(&table, a, &orig) == slot) tw_mte_set_tag(a, orig);
+        if (tw_wtab_get(&table, a, &orig) == slot) (void)tw_mte_try_set_tag(a, orig);
     }
+    if (!tw_arena_owns((const void *)(uintptr_t)w->base)) atomic_fetch_sub(&tw_inplace_watches, 1);
     uint64_t n = tw_wtab_remove(&table, w->gbase, w->glen, slot);
     atomic_fetch_sub(&tw_armed_granules, n);
     atomic_fetch_add(&tw_watch_generation, 1);
@@ -74,6 +90,7 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     if (len == 0 || addr + len < addr || !(mode & TAGWATCH_RW)) return -TAGWATCH_EINVAL;
     uint64_t gbase = addr & ~TW_GRANULE_MASK;
     uint64_t glen = ((addr + len + TW_GRANULE_MASK) & ~TW_GRANULE_MASK) - gbase;
+    if (in_own_fork()) return -TAGWATCH_EBUSY;
 
     os_unfair_lock_lock(&lock);
     uint32_t slot = slot_alloc();
@@ -125,6 +142,8 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     w->flags = TW_WF_ACTIVE;
     w->mode = (uint8_t)mode;
     w->origin = (uint8_t)origin;
+    w->id = make_id(slot, w->serial);
+    if (!tw_arena_owns((const void *)(uintptr_t)addr)) atomic_fetch_add(&tw_inplace_watches, 1);
     if (label) strlcpy(w->label, label, sizeof w->label);
     live_watches++;
     total_watches++;
@@ -134,10 +153,11 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     os_unfair_lock_unlock(&lock);
 
     tw_emit_watch(&copy, bt, nbt);
-    return make_id(slot, copy.serial);
+    return copy.id;
 }
 
 static int remove_slot(uint32_t slot, uint64_t serial_or_zero, const char *reason) {
+    if (in_own_fork()) return -TAGWATCH_ENOENT;
     os_unfair_lock_lock(&lock);
     if (slot == 0 || slot >= n_slots) {
         os_unfair_lock_unlock(&lock);
@@ -158,10 +178,11 @@ static int remove_slot(uint32_t slot, uint64_t serial_or_zero, const char *reaso
 
 int tw_watch_remove_id(tagwatch_id id, const char *reason) {
     if (id <= 0) return -TAGWATCH_ENOENT;
-    return remove_slot((uint32_t)(id & TW_SLOT_MAX), (uint64_t)id >> 28, reason);
+    return remove_slot((uint32_t)(id & TW_SLOT_MAX), (uint64_t)id >> ID_SHIFT, reason);
 }
 
 int tw_watch_remove_addr(uint64_t addr, const char *reason) {
+    if (in_own_fork()) return -TAGWATCH_ENOENT;
     os_unfair_lock_lock(&lock);
     uint32_t slot = tw_wtab_get(&table, addr & TW_ADDR_MASK, NULL);
     os_unfair_lock_unlock(&lock);
@@ -173,6 +194,7 @@ int tw_watch_remove_addr(uint64_t addr, const char *reason) {
 int tw_watch_remove_range(uint64_t addr, uint64_t len, const char *reason) {
     int n = 0;
     addr &= TW_ADDR_MASK;
+    if (in_own_fork()) return 0;
     for (;;) {
         os_unfair_lock_lock(&lock);
         uint32_t slot = tw_wtab_find(&table, addr, len, NULL);
@@ -189,6 +211,7 @@ int tw_watch_mark_freed(uint64_t addr, uint64_t len) {
     int n = 0;
     addr &= TW_ADDR_MASK;
     uint64_t end = addr + len;
+    if (in_own_fork()) return 0;
     os_unfair_lock_lock(&lock);
     while (addr < end) {
         uint64_t hit = 0;
@@ -211,6 +234,7 @@ int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_w
                  unsigned *tag_now) {
     ea &= TW_ADDR_MASK;
     far &= TW_ADDR_MASK;
+    if (in_own_fork()) return 0;
     os_unfair_lock_lock(&lock);
     uint32_t slot = size ? tw_wtab_find(&table, ea, size, NULL) : 0;
     if (!slot) slot = tw_wtab_get(&table, far, NULL);
@@ -237,33 +261,67 @@ int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_w
 }
 
 int tw_watch_overlaps(uint64_t addr, uint64_t len) {
-    if (atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) == 0 || len == 0) return 0;
+    if (atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) == 0 || len == 0 || in_own_fork()) return 0;
     os_unfair_lock_lock(&lock);
     uint32_t slot = tw_wtab_find(&table, addr & TW_ADDR_MASK, len, NULL);
     os_unfair_lock_unlock(&lock);
     return slot != 0;
 }
 
+static void restore_tag(uint64_t addr, unsigned orig_tag, void *ctx) {
+    (void)ctx;
+    (void)tw_mte_try_set_tag(addr, orig_tag);
+}
+
+// fork() copies the address space one VM entry at a time while other threads
+// keep running, so the child's copy of the table and its copy of the tags
+// could come from different instants. The forking thread therefore holds
+// the lock from before the fork until after it: no arming or disarming is
+// in progress while the kernel copies, and the child's snapshot is
+// consistent. (wtab.c additionally orders its stores so that a snapshot
+// taken mid-operation is safe to walk, but that alone is not enough.)
+void tw_watch_before_fork(void) {
+    os_unfair_lock_lock(&lock);
+    atomic_store(&fork_thread, pthread_self());
+}
+void tw_watch_after_fork_parent(void) {
+    atomic_store(&fork_thread, NULL);
+    os_unfair_lock_unlock(&lock);
+}
+
 void tw_watch_disarm_all(void) {
-    // Runs in a fork child, where the lock may have been held by a thread
-    // that no longer exists.
+    // Runs in a fork child. The lock was held by the forking thread, which
+    // is the only thread that exists here; the child's copy is re-initialised
+    // rather than unlocked because os_unfair_lock records its owner. The
+    // table says exactly which granules carry a watch tag and what to put
+    // back; it is left as it is afterwards, as the child never arms anything
+    // again.
     lock = OS_UNFAIR_LOCK_INIT;
-    for (uint32_t s = 1; s < n_slots; s++) {
-        tw_watch *w = slot_ptr(s);
-        if (!(w->flags & TW_WF_ACTIVE)) continue;
-        for (uint64_t a = w->gbase; a != w->gbase + w->glen; a += TW_GRANULE) {
-            unsigned orig;
-            if (tw_wtab_get(&table, a, &orig) == s) tw_mte_set_tag(a, orig);
-        }
-        w->flags = 0;
-    }
-    tw_wtab_destroy(&table);
-    tw_wtab_init(&table, &tw_vm_mem);
+    atomic_store(&fork_thread, NULL);
+    tw_wtab_foreach_armed(&table, restore_tag, NULL);
+    for (uint32_t s = 1; s < n_slots; s++) slot_ptr(s)->flags = 0;
     atomic_store(&tw_armed_granules, 0);
+    atomic_store(&tw_inplace_watches, 0);
     live_watches = 0;
 }
 
+// Probes whether the page holding addr is an MTE mapping, under the watch
+// lock so that the probe (which writes the tag it just read) cannot race
+// with a watch being armed or disarmed on the same granule.
+int tw_watch_page_taggable(uint64_t addr) {
+    if (in_own_fork()) return 0;
+    os_unfair_lock_lock(&lock);
+    int tag = tw_mte_try_get_tag(addr);
+    int ok = tag >= 0 && tw_mte_try_set_tag(addr, (unsigned)tag) == 0;
+    os_unfair_lock_unlock(&lock);
+    return ok;
+}
+
 void tw_watch_counts(uint64_t *live, uint64_t *total, uint64_t *granules) {
+    if (in_own_fork()) {
+        *live = *total = *granules = 0;
+        return;
+    }
     os_unfair_lock_lock(&lock);
     *live = live_watches;
     *total = total_watches;

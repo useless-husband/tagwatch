@@ -40,6 +40,7 @@ void *tw_vm_alloc(size_t size); // zero-filled, page-granular
 void tw_vm_free(void *p, size_t size);
 void *tw_vm_alloc_mte(size_t size);
 extern const tw_mem tw_vm_mem;
+void tw_vm_after_fork(void);
 
 // ---- watch.c: watch records, arming and disarming ---------------------------
 enum {
@@ -57,6 +58,7 @@ typedef struct {
     uint64_t base, len;         // what was asked for
     uint64_t gbase, glen;       // granule-aligned range that is armed
     uint64_t serial;            // id printed in the trace; never reused
+    tagwatch_id id;             // what tagwatch_watch() returned
     uint64_t reads, writes;
     uint32_t flags;
     uint8_t mode, origin;
@@ -83,9 +85,15 @@ int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_w
 int tw_watch_overlaps(uint64_t addr, uint64_t len);
 // Restores the original tag of every armed granule (fork child).
 void tw_watch_disarm_all(void);
+// Holds the watch lock across fork() so the child sees a consistent table.
+void tw_watch_before_fork(void);
+void tw_watch_after_fork_parent(void);
+// 1 if the page holding addr is an MTE mapping (probe under the watch lock).
+int tw_watch_page_taggable(uint64_t addr);
 void tw_watch_counts(uint64_t *live, uint64_t *total, uint64_t *granules);
 extern _Atomic uint64_t tw_armed_granules;
 extern _Atomic uint64_t tw_watch_generation; // bumped whenever a watch is armed or disarmed
+extern _Atomic uint64_t tw_inplace_watches;  // live watches on memory outside the arena
 
 // ---- tramp.c: out-of-line execution slots ------------------------------------
 int tw_tramp_init(void);

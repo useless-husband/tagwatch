@@ -168,7 +168,8 @@ static void report(const tw_watch *w, uint64_t addr, unsigned size, unsigned acc
     ev.addr = addr;
     ev.size = size;
     ev.access = access;
-    ev.watch = (tagwatch_id)w->serial;
+    ev.watch = w->id;
+    ev.watch_serial = w->serial;
     ev.watch_base = w->base;
     ev.watch_len = w->len;
     ev.offset = (int64_t)(addr - w->base);

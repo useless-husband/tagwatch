@@ -125,6 +125,23 @@ int main(void) {
     tagwatch_get_stats(&st);
     CHECK(st.watches_live == live_before);
 
+    // realloc of a system-heap block that is watched in place from its first
+    // byte: the contents must survive (the allocator cannot size it while armed).
+    char *grow = malloc(48);
+    memset(grow, 0x77, 48);
+    CHECK(tagwatch_watch(grow, 48, "inplace") > 0);
+    grow = realloc(grow, 900); // 900 matches no spec: stays in the system heap
+    mt_reset();
+    int kept = 1;
+    for (int i = 0; i < 48; i++) kept &= load8(grow + i) == 0x77;
+    CHECK(kept);
+    CHECK_EQ(mt_count(), 0);
+    grow = realloc(grow, 777); // and into a watched size from there
+    CHECK(load8(grow + 47) == 0x77);
+    CHECK_EQ(mt_count(), 1);
+    void *zero = realloc(grow, 0); // frees; returns a minimal block like the system realloc
+    free(zero);
+
     // --- use after free -----------------------------------------------------------------------
     mt_reset();
     free(a);

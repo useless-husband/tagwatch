@@ -48,7 +48,7 @@ static inline int alloc_specs_active(void) { return tw_rt.have_alloc_specs && tw
 // A system-heap block that was watched in place must be disarmed before the
 // allocator sees it again: the allocator checks and rewrites tags itself.
 static inline void release_inplace_watch(void *p) {
-    if (p && atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) && tw_on() && !tw_arena_owns(p)) {
+    if (p && atomic_load_explicit(&tw_inplace_watches, memory_order_relaxed) && tw_on() && !tw_arena_owns(p)) {
         // The allocator does not recognise a block whose first granule is
         // retagged, so disarm that one first; then the block's size is known
         // and watches on interior ranges can be found.
@@ -135,16 +135,17 @@ static void *tw_realloc(void *p, size_t size) {
     }
     // One side of the move lives in the arena: allocate, copy, release. The
     // old object may be armed, so the copy runs with tag checks off.
-    if (p && size == 0) {
+    if (p && size == 0) { // as the system realloc: release, and hand back a minimal block
         free(p);
-        return NULL;
+        return malloc(0);
     }
     void *q = spec >= 0 ? tw_alloc_watched(size, TW_GRANULE, spec, FRAME) : malloc(size);
     if (!q) return NULL;
     if (p) {
+        // Disarm first: the allocator cannot size a block whose first granule is retagged.
+        release_inplace_watch(p);
         size_t old = ours ? tw_arena_size(p) : malloc_size(p);
         tagwatch_poke(q, p, old < size ? old : size);
-        release_inplace_watch(p);
         free(p);
     }
     return q;

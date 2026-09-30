@@ -19,13 +19,6 @@
 #define VM_FLAGS_MTE 0x00002000
 #endif
 
-static int page_is_taggable(uint64_t page) {
-    // Storing the tag a granule already has changes nothing, and fails
-    // (recoverably) exactly when the page is not an MTE mapping.
-    int tag = tw_mte_try_get_tag(page);
-    return tag >= 0 && tw_mte_try_set_tag(page, (unsigned)tag) == 0;
-}
-
 static kern_return_t region_prot(uint64_t addr, vm_prot_t *prot, vm_prot_t *max_prot) {
     mach_vm_address_t a = addr;
     mach_vm_size_t size = 0;
@@ -77,7 +70,9 @@ int tw_adopt(uint64_t addr, uint64_t len) {
     int rc = 0;
     for (uint64_t i = 0; i < npages && rc == 0; i++) {
         uint64_t page = lo + (i << TW_PAGE_SHIFT);
-        if (page_is_taggable(page)) continue;
+        // Storing the tag a granule already has changes nothing, and fails
+        // (recoverably) exactly when the page is not an MTE mapping.
+        if (tw_watch_page_taggable(page)) continue;
         vm_prot_t prot, max_prot;
         if (region_prot(page, &prot, &max_prot) != KERN_SUCCESS) rc = -TAGWATCH_EINVAL; // not mapped
         else if ((prot & VM_PROT_EXECUTE) || !(prot & VM_PROT_READ) || (page < stack_hi && page + TW_PAGE_SIZE > stack_lo))

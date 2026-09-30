@@ -6,11 +6,16 @@
 // share granules. Here every block starts on a granule boundary, occupies
 // whole granules, can be any size, and nobody else changes its tags.
 //
-// The arena is one large MTE-enabled virtual reservation that the kernel
-// populates lazily, so "does this pointer belong to tagwatch" is a range
-// check. It is registered as a malloc zone: free(), realloc() and
-// malloc_size() on an arena block find their way here even when called from
-// code the interposers cannot see.
+// The arena is a set of MTE-enabled regions that the kernel populates
+// lazily, so "does this pointer belong to tagwatch" is a few range checks.
+// Regions are mapped on demand, 256 MB at a time (a block larger than that
+// gets a region of its own), rather than as one huge reservation up front:
+// fork() copies the tag storage of an MTE mapping whether or not its pages
+// were ever touched, at about 8 ms per GB on the M5, so the reservation must
+// stay in proportion to what the program actually watches. The arena is
+// registered as a malloc zone: free(), realloc() and malloc_size() on an
+// arena block find their way here even when called from code the
+// interposers cannot see.
 //
 // Freed blocks that were watched stay armed in a FIFO quarantine, so a
 // use-after-free of a watched object is reported instead of going unnoticed.
@@ -36,6 +41,8 @@
 #define N_CLASSES (N_SMALL + POW_MAX - POW_MIN + 1)
 #define REFILL (256u << 10)
 #define QUEUE 65536
+#define REGION_BYTES (256ull << 20)
+#define MAX_REGIONS 256
 
 typedef struct {
     uint32_t magic;
@@ -45,8 +52,15 @@ typedef struct {
     uint64_t pad;
 } hdr_t;
 
+typedef struct {
+    uint64_t lo, hi;
+} region_t;
+
 static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
-static uint64_t base, next, end;
+static region_t regions[MAX_REGIONS];
+static _Atomic int n_regions; // entries below this are complete (release/acquire)
+static uint64_t next, end;    // bump pointer inside the newest region
+static uint64_t carved;       // bytes handed out of all regions so far
 static uint64_t free_list[N_CLASSES]; // singly linked through the first word of each free block
 static uint64_t bump[N_CLASSES], bump_end[N_CLASSES];
 static uint64_t quarantine[QUEUE];
@@ -55,9 +69,34 @@ static uint64_t q_bytes, q_limit = 1 << 20;
 static malloc_zone_t zone;
 static malloc_introspection_t introspect;
 
-int tw_arena_owns(const void *p) {
-    uint64_t a = (uint64_t)(uintptr_t)p & TW_ADDR_MASK;
-    return a >= base && a < end;
+// Index of the region holding a, or -1. Lock-free: regions are only ever
+// appended, and an entry is filled before the count that covers it is
+// published.
+static int region_of(uint64_t a) {
+    int n = atomic_load_explicit(&n_regions, memory_order_acquire);
+    for (int i = n - 1; i >= 0; i--)
+        if (a >= regions[i].lo && a < regions[i].hi) return i;
+    return -1;
+}
+
+int tw_arena_owns(const void *p) { return region_of((uint64_t)(uintptr_t)p & TW_ADDR_MASK) >= 0; }
+
+// Maps a new MTE region of at least `bytes` and makes it the one to carve
+// from. Caller holds the lock.
+static int region_add(uint64_t bytes) {
+    int n = atomic_load_explicit(&n_regions, memory_order_relaxed);
+    if (n == MAX_REGIONS) return -1;
+    uint64_t size = bytes > REGION_BYTES ? bytes : REGION_BYTES;
+    mach_vm_address_t addr = 0;
+    if (mach_vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_MTE, MACH_PORT_NULL, 0, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT) != KERN_SUCCESS)
+        return -1;
+    regions[n].lo = addr;
+    regions[n].hi = addr + size;
+    atomic_store_explicit(&n_regions, n + 1, memory_order_release);
+    next = addr;
+    end = addr + size;
+    return 0;
 }
 
 static int class_of(uint64_t cap, uint64_t *class_cap) {
@@ -74,11 +113,14 @@ static int class_of(uint64_t cap, uint64_t *class_cap) {
     return -1; // huge: carved directly, never recycled
 }
 
+// Caller holds the lock. The remainder of a region that cannot hold the
+// request is abandoned; class free lists still recycle every block in it.
 static uint64_t carve(uint64_t bytes) {
     bytes = (bytes + TW_PAGE_SIZE - 1) & ~(TW_PAGE_SIZE - 1);
-    if (end - next < bytes) return 0;
+    if (end - next < bytes && region_add(bytes) != 0) return 0;
     uint64_t p = next;
     next += bytes;
+    carved += bytes;
     return p;
 }
 
@@ -132,7 +174,8 @@ void *tw_arena_alloc(size_t size, size_t align) {
 // Header of a live or quarantined block, or NULL.
 static hdr_t *header_of(const void *p) {
     uint64_t a = (uint64_t)(uintptr_t)p & TW_ADDR_MASK;
-    if (a < base + HDR || a >= end || (a & TW_GRANULE_MASK)) return NULL;
+    int r = region_of(a);
+    if (r < 0 || a < regions[r].lo + HDR || (a & TW_GRANULE_MASK)) return NULL;
     hdr_t *h = (hdr_t *)(uintptr_t)(a - HDR);
     return h->magic == MAGIC || h->magic == MAGIC_FREED ? h : NULL;
 }
@@ -296,7 +339,7 @@ static void i_force_unlock(malloc_zone_t *z) {
 static void i_statistics(malloc_zone_t *z, malloc_statistics_t *stats) {
     (void)z;
     memset(stats, 0, sizeof *stats);
-    stats->size_allocated = next - base;
+    stats->size_allocated = carved;
 }
 static boolean_t i_locked(malloc_zone_t *z) {
     (void)z;
@@ -308,16 +351,10 @@ static void i_reinit_lock(malloc_zone_t *z) {
 }
 
 int tw_arena_init(void) {
-    static const uint64_t sizes[] = {64ull << 30, 8ull << 30, 1ull << 30};
-    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0] && !base; i++) {
-        mach_vm_address_t addr = 0;
-        if (mach_vm_map(mach_task_self(), &addr, sizes[i], 0, VM_FLAGS_ANYWHERE | VM_FLAGS_MTE, MACH_PORT_NULL, 0, FALSE,
-                        VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT) == KERN_SUCCESS) {
-            base = next = addr;
-            end = addr + sizes[i];
-        }
-    }
-    if (!base) return -1;
+    os_unfair_lock_lock(&lock);
+    int rc = region_add(0);
+    os_unfair_lock_unlock(&lock);
+    if (rc != 0) return -1;
 
     introspect.enumerator = i_enumerator;
     introspect.good_size = i_good_size;

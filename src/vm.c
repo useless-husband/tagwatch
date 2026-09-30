@@ -70,3 +70,6 @@ static void mem_release(void *p, size_t size) {
 }
 
 const tw_mem tw_vm_mem = {mem_alloc, mem_release};
+
+// The lock may have been held by a thread that does not exist in the child.
+void tw_vm_after_fork(void) { small_lock = OS_UNFAIR_LOCK_INIT; }

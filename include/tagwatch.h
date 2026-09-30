@@ -62,7 +62,8 @@ typedef struct tagwatch_event {
     uint64_t addr;      /* first byte accessed */
     uint32_t size;      /* bytes accessed */
     uint32_t access;    /* TAGWATCH_READ, TAGWATCH_WRITE or TAGWATCH_RW */
-    tagwatch_id watch;  /* as printed in the trace */
+    tagwatch_id watch;  /* the id tagwatch_watch() returned for this watch */
+    uint64_t watch_serial; /* the "#N" shown in the log and the trace */
     uint64_t watch_base;/* start of the watched object */
     uint64_t watch_len;
     int64_t offset;     /* addr - watch_base */
@@ -77,7 +78,9 @@ typedef struct tagwatch_event {
 
 /*
  * Called on tagwatch's handler thread for every reported access, while the
- * accessing thread is frozen at the instruction. It must not call malloc,
+ * accessing thread is frozen at the instruction. (Accesses made by the kernel
+ * in a wrapped system call are reported on the calling thread instead, so
+ * the callback can run on two threads at once.) It must not call malloc,
  * stdio, or anything else that may take a lock the frozen thread holds, and
  * it must not touch watched memory through ordinary pointers — use
  * tagwatch_peek(). Return nonzero to suppress the default log output.

@@ -36,11 +36,25 @@ const char *tagwatch_strerror(int code) {
 // ---- fork -------------------------------------------------------------------
 // Watches do not follow fork. The child has no exception thread and is not
 // traced, so a tag fault there would simply kill it; instead every granule
-// gets its original tag back before the child runs any program code.
+// gets its original tag back before the child runs any program code. For
+// that the child needs a consistent picture of which granules are armed,
+// which the parent guarantees by holding the watch lock across the fork.
+static void atfork_prepare(void) {
+    if (tw_on()) tw_watch_before_fork();
+}
+
+static void atfork_parent(void) {
+    if (tw_on()) tw_watch_after_fork_parent();
+}
+
 static void atfork_child(void) {
     if (!tw_on()) return;
     tw_rt.state = TW_STATE_FORKED;
     tw_out_after_fork();
+    tw_vm_after_fork();
+    // Disarm before detaching from the exception port: the guarded tag
+    // stores used to disarm are still served, through the inherited port,
+    // by the parent's exception thread, should one of them ever fault.
     tw_watch_disarm_all();
     tw_exc_after_fork_child();
     tw_tco_force(0);
@@ -177,7 +191,7 @@ static int init_once(void) {
     tw_arena_set_quarantine(env_u64("TAGWATCH_QUARANTINE", 1 << 20));
     pthread_key_create(&pause_key, NULL);
     tw_interpose_init();
-    pthread_atfork(NULL, NULL, atfork_child);
+    pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
     tw_rt.state = TW_STATE_ON;
     tw_emit_start("out-of-line");
     apply_static_specs();
@@ -321,7 +335,8 @@ void tw_report_syscall(const char *name, uint64_t addr, uint64_t len, unsigned a
     ev.addr = lo;
     ev.size = (uint32_t)(hi - lo);
     ev.access = access;
-    ev.watch = (tagwatch_id)w.serial;
+    ev.watch = w.id;
+    ev.watch_serial = w.serial;
     ev.watch_base = w.base;
     ev.watch_len = w.len;
     ev.offset = (int64_t)(lo - w.base);
