@@ -86,6 +86,7 @@ int main(void) {
     long local = 1;
     CHECK(tagwatch_watch(&local, sizeof local, "stack") == -TAGWATCH_ENOTTAGGED);
     CHECK(tagwatch_watch(&on_stack_probe, 8, "global") == -TAGWATCH_ENOTTAGGED);
+    CHECK(tagwatch_watch((void *)0x10, 8, "unmapped") == -TAGWATCH_ENOTTAGGED);
     char *big = malloc(1 << 20); // large system allocations are not tagged
     CHECK(tagwatch_watch(big, 64, "big") == -TAGWATCH_ENOTTAGGED);
     big[0] = 1;

@@ -25,6 +25,8 @@ void tw_mte_set_tag(uint64_t addr, unsigned tag);
 // Like tw_mte_set_tag, but returns -1 instead of crashing when the page is
 // not an MTE mapping. Needs the exception thread (exc.c) to be running.
 int tw_mte_try_set_tag(uint64_t addr, unsigned tag);
+// Like tw_mte_get_tag, but returns -1 instead of crashing on unmapped memory.
+int tw_mte_try_get_tag(uint64_t addr);
 // If pc is one of the guarded instructions above, returns where to resume.
 uint64_t tw_mte_recover_pc(uint64_t pc);
 // PSTATE.TCO: when set, the calling thread's accesses are not tag-checked.
@@ -163,6 +165,8 @@ void *tw_alloc_watched(size_t size, size_t align, int spec_idx, const void *fram
 // Reports a system call that is about to read (kernel reads user memory) or
 // write a watched buffer.
 void tw_report_syscall(const char *name, uint64_t addr, uint64_t len, unsigned access, const void *frame);
+
+void tw_interpose_init(void);
 
 // adopt.c
 int tw_adopt(uint64_t addr, uint64_t len);

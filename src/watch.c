@@ -87,13 +87,17 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
         os_unfair_lock_unlock(&lock);
         return rc == -EEXIST ? -TAGWATCH_EEXIST : rc == -ENOMEM ? -TAGWATCH_ENOMEM : -TAGWATCH_EINVAL;
     }
-    // Arm. The first store to each page is the guarded one: it reports
-    // memory that is not in an MTE mapping instead of crashing.
+    // Arm. The first load and store on each page are the guarded ones: they
+    // report unmapped memory, and memory that is not in an MTE mapping,
+    // instead of crashing.
     uint64_t a = gbase, probed_page = UINT64_MAX;
     for (; a != gbase + glen; a += TW_GRANULE) {
-        unsigned orig = tw_mte_get_tag(a), wt = tw_watch_tag(orig);
+        int fresh_page = (a >> TW_PAGE_SHIFT) != probed_page;
+        int got = fresh_page ? tw_mte_try_get_tag(a) : (int)tw_mte_get_tag(a);
+        if (got < 0) break;
+        unsigned orig = (unsigned)got, wt = tw_watch_tag(orig);
         tw_wtab_set_orig_tag(&table, a, orig);
-        if ((a >> TW_PAGE_SHIFT) != probed_page) {
+        if (fresh_page) {
             if (tw_mte_try_set_tag(a, wt) != 0) break;
             probed_page = a >> TW_PAGE_SHIFT;
         } else {

@@ -176,6 +176,7 @@ static int init_once(void) {
     }
     tw_arena_set_quarantine(env_u64("TAGWATCH_QUARANTINE", 1 << 20));
     pthread_key_create(&pause_key, NULL);
+    tw_interpose_init();
     pthread_atfork(NULL, NULL, atfork_child);
     tw_rt.state = TW_STATE_ON;
     tw_emit_start("out-of-line");

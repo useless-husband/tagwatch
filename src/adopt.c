@@ -22,7 +22,8 @@
 static int page_is_taggable(uint64_t page) {
     // Storing the tag a granule already has changes nothing, and fails
     // (recoverably) exactly when the page is not an MTE mapping.
-    return tw_mte_try_set_tag(page, tw_mte_get_tag(page)) == 0;
+    int tag = tw_mte_try_get_tag(page);
+    return tag >= 0 && tw_mte_try_set_tag(page, (unsigned)tag) == 0;
 }
 
 static kern_return_t region_prot(uint64_t addr, vm_prot_t *prot, vm_prot_t *max_prot) {

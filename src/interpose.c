@@ -10,17 +10,26 @@
 //    system call). The shims run such calls against a private bounce buffer
 //    and copy with tag checks off, and report the access.
 //
+//  * sigaction/signal, to wrap handlers (see the end of this file), and the
+//    blocking calls most often hit by a side effect of being traced: when a
+//    traced process receives any signal it stops, and the stop makes blocking
+//    system calls in all its threads return EINTR even though no handler ran.
+//    POSIX never does that, so the shims retry in exactly that case.
+//
 // Calls made from inside this library are not interposed, so malloc() and
 // read() below are the real ones.
 #include <errno.h>
 #include <malloc/malloc.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "internal.h"
@@ -155,6 +164,43 @@ INTERPOSE(tw_free, free);
 INTERPOSE(tw_realloc, realloc);
 INTERPOSE(tw_reallocf, reallocf);
 
+// ---- spurious EINTR -----------------------------------------------------------------
+// Number of signal handlers that have run on the calling thread, kept in a
+// pthread key (no allocation, usable from a handler). EINTR with this number
+// unchanged means no handler ran: the interruption came from the trace stop.
+static pthread_key_t handler_runs_key;
+static _Atomic int handler_runs_ready;
+
+static inline uintptr_t handler_runs(void) {
+    return atomic_load_explicit(&handler_runs_ready, memory_order_relaxed) ? (uintptr_t)pthread_getspecific(handler_runs_key) : 0;
+}
+
+#define RETRY_EINTR(result, call)                                                   \
+    do {                                                                            \
+        uintptr_t before_ = handler_runs();                                         \
+        result = (call);                                                            \
+        if (result != -1 || errno != EINTR || !tw_on() || handler_runs() != before_) break; \
+    } while (1)
+
+static pid_t tw_waitpid(pid_t pid, int *status, int options) {
+    pid_t r;
+    RETRY_EINTR(r, waitpid(pid, status, options));
+    return r;
+}
+static pid_t tw_wait(int *status) {
+    pid_t r;
+    RETRY_EINTR(r, wait(status));
+    return r;
+}
+static pid_t tw_wait4(pid_t pid, int *status, int options, struct rusage *ru) {
+    pid_t r;
+    RETRY_EINTR(r, wait4(pid, status, options, ru));
+    return r;
+}
+INTERPOSE(tw_waitpid, waitpid);
+INTERPOSE(tw_wait, wait);
+INTERPOSE(tw_wait4, wait4);
+
 // ---- system calls on watched buffers -----------------------------------------------
 static inline int touches_watch(const void *buf, size_t len) {
     return atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) && tw_on() &&
@@ -169,7 +215,8 @@ static inline int touches_watch(const void *buf, size_t len) {
             errno = ENOMEM;                                                                      \
             return -1;                                                                           \
         }                                                                                        \
-        ssize_t r = call_with_tmp;                                                               \
+        ssize_t r;                                                                               \
+        RETRY_EINTR(r, call_with_tmp);                                                           \
         int saved_errno = errno;                                                                 \
         if (r > 0) {                                                                             \
             tw_report_syscall(name, (uint64_t)(uintptr_t)(buf), (uint64_t)r, TAGWATCH_WRITE, FRAME); \
@@ -189,7 +236,8 @@ static inline int touches_watch(const void *buf, size_t len) {
             return -1;                                                                           \
         }                                                                                        \
         tagwatch_peek(tmp, buf, len);                                                            \
-        ssize_t r = call_with_tmp;                                                               \
+        ssize_t r;                                                                               \
+        RETRY_EINTR(r, call_with_tmp);                                                           \
         int saved_errno = errno;                                                                 \
         if (r > 0) tw_report_syscall(name, (uint64_t)(uintptr_t)(buf), (uint64_t)r, TAGWATCH_READ, FRAME); \
         tw_vm_free(tmp, len);                                                                    \
@@ -199,27 +247,39 @@ static inline int touches_watch(const void *buf, size_t len) {
 
 static ssize_t tw_read(int fd, void *buf, size_t len) {
     if (len && touches_watch(buf, len)) BOUNCE_IN("read", read(fd, tmp, len), buf, len);
-    return read(fd, buf, len);
+    ssize_t r;
+    RETRY_EINTR(r, read(fd, buf, len));
+    return r;
 }
 static ssize_t tw_pread(int fd, void *buf, size_t len, off_t off) {
     if (len && touches_watch(buf, len)) BOUNCE_IN("pread", pread(fd, tmp, len, off), buf, len);
-    return pread(fd, buf, len, off);
+    ssize_t r;
+    RETRY_EINTR(r, pread(fd, buf, len, off));
+    return r;
 }
 static ssize_t tw_recv(int fd, void *buf, size_t len, int flags) {
     if (len && touches_watch(buf, len)) BOUNCE_IN("recv", recv(fd, tmp, len, flags), buf, len);
-    return recv(fd, buf, len, flags);
+    ssize_t r;
+    RETRY_EINTR(r, recv(fd, buf, len, flags));
+    return r;
 }
 static ssize_t tw_write(int fd, const void *buf, size_t len) {
     if (len && touches_watch(buf, len)) BOUNCE_OUT("write", write(fd, tmp, len), buf, len);
-    return write(fd, buf, len);
+    ssize_t r;
+    RETRY_EINTR(r, write(fd, buf, len));
+    return r;
 }
 static ssize_t tw_pwrite(int fd, const void *buf, size_t len, off_t off) {
     if (len && touches_watch(buf, len)) BOUNCE_OUT("pwrite", pwrite(fd, tmp, len, off), buf, len);
-    return pwrite(fd, buf, len, off);
+    ssize_t r;
+    RETRY_EINTR(r, pwrite(fd, buf, len, off));
+    return r;
 }
 static ssize_t tw_send(int fd, const void *buf, size_t len, int flags) {
     if (len && touches_watch(buf, len)) BOUNCE_OUT("send", send(fd, tmp, len, flags), buf, len);
-    return send(fd, buf, len, flags);
+    ssize_t r;
+    RETRY_EINTR(r, send(fd, buf, len, flags));
+    return r;
 }
 
 // stdio reaches the kernel through its own buffer for small requests, but
@@ -275,6 +335,8 @@ static _Atomic int user_siginfo[NSIG];
 
 static void signal_entry(int sig, siginfo_t *si, void *uc) {
     tw_tco_force(0);
+    if (atomic_load_explicit(&handler_runs_ready, memory_order_relaxed))
+        pthread_setspecific(handler_runs_key, (void *)((uintptr_t)pthread_getspecific(handler_runs_key) + 1));
     uintptr_t h = atomic_load(&user_handler[sig]);
     if (atomic_load(&user_siginfo[sig])) ((void (*)(int, siginfo_t *, void *))h)(sig, si, uc);
     else ((void (*)(int))h)(sig);
@@ -282,6 +344,10 @@ static void signal_entry(int sig, siginfo_t *si, void *uc) {
 
 static int is_real_handler(const struct sigaction *sa) {
     return sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_ERR;
+}
+
+void tw_interpose_init(void) {
+    if (pthread_key_create(&handler_runs_key, NULL) == 0) atomic_store(&handler_runs_ready, 1);
 }
 
 static int tw_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
