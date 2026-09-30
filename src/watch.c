@@ -25,6 +25,7 @@ static uint32_t free_head;   // free slots are chained through .serial
 static uint64_t next_serial = 1;
 static uint64_t live_watches, total_watches;
 _Atomic uint64_t tw_armed_granules;
+_Atomic uint64_t tw_watch_generation;
 
 static tw_watch *slot_ptr(uint32_t slot) { return &chunks[slot / CHUNK][slot % CHUNK]; }
 
@@ -63,6 +64,7 @@ static void disarm_locked(uint32_t slot) {
     }
     uint64_t n = tw_wtab_remove(&table, w->gbase, w->glen, slot);
     atomic_fetch_sub(&tw_armed_granules, n);
+    atomic_fetch_add(&tw_watch_generation, 1);
     live_watches--;
 }
 
@@ -123,6 +125,7 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     live_watches++;
     total_watches++;
     atomic_fetch_add(&tw_armed_granules, glen / TW_GRANULE);
+    atomic_fetch_add(&tw_watch_generation, 1);
     tw_watch copy = *w;
     os_unfair_lock_unlock(&lock);
 
@@ -175,13 +178,18 @@ int tw_watch_mark_freed(uint64_t addr) {
     return slot != 0;
 }
 
-int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack) {
+int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+                 unsigned *tag_now) {
     ea &= TW_ADDR_MASK;
     far &= TW_ADDR_MASK;
     os_unfair_lock_lock(&lock);
     uint32_t slot = size ? tw_wtab_find(&table, ea, size, NULL) : 0;
     if (!slot) slot = tw_wtab_get(&table, far, NULL);
     if (!slot) {
+        // Read the granule's tag while still holding the lock: arming and
+        // disarming change the table and the tags under this same lock, so
+        // "not in the table" and "this tag" describe one consistent moment.
+        if (tag_now) *tag_now = tw_mte_get_tag(far);
         os_unfair_lock_unlock(&lock);
         return 0;
     }

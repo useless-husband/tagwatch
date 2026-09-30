@@ -61,7 +61,7 @@ typedef struct {
     unsigned ll_size;
     uint64_t ll_val[2];
     // consecutive "tags match now, retry" decisions at the same pc
-    uint64_t retry_pc;
+    uint64_t retry_pc, retry_gen;
     unsigned retries;
 } tinfo_t;
 
@@ -265,7 +265,17 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
         ns->__pc = fix;
         return KERN_SUCCESS;
     }
-    if (rq->code[0] != EXC_CODE_MTE_TAGCHECK) return KERN_FAILURE;
+    if (rq->code[0] != EXC_CODE_MTE_TAGCHECK) {
+        if (tw_rt.verbose) { // an ordinary crash: say where, then let it take its course
+            char msg[160];
+            tw_buf b;
+            tw_buf_init(&b, msg, sizeof msg);
+            tw_put_fmt(&b, "passing on EXC_BAD_ACCESS (code %lld) at address %p, pc %p", (long long)rq->code[0],
+                       (void *)(uintptr_t)rq->code[1], (void *)(uintptr_t)pc);
+            tw_emit_note("crash", msg);
+        }
+        return KERN_FAILURE;
+    }
 
     if (tw_tramp_owner(pc, &entry, &orig_pc, &word)) {
         // A fault inside a slot means the thread lost PSTATE.TCO between the
@@ -302,14 +312,19 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
     tinfo_t *ti = thread_info_for(rq->thread.name, ns->__sp);
     tw_watch w;
     uint64_t slack = 0;
-    if (!tw_watch_hit(ea, size, far, access, &w, &slack)) {
+    unsigned tag_now = 0;
+    if (!tw_watch_hit(ea, size, far, access, &w, &slack, &tag_now)) {
         // Not a watched granule. If the pointer's tag matches the granule now,
         // the watch was removed while this fault was in flight: just retry.
-        // (Bounded, in case the fault address is not the granule that failed.)
+        // The retry is bounded in case the reported address is not the granule
+        // that failed the check, but only while the set of watches stands
+        // still: under arm/disarm churn any number of retries is legitimate.
         unsigned ptag = (unsigned)((uint64_t)rq->code[1] >> 56) & 0xf;
-        if (tw_mte_get_tag(far) == ptag) {
-            if (ti->retry_pc != pc) ti->retries = 0;
+        if (tag_now == ptag) {
+            uint64_t gen = atomic_load(&tw_watch_generation);
+            if (ti->retry_pc != pc || ti->retry_gen != gen) ti->retries = 0;
             ti->retry_pc = pc;
+            ti->retry_gen = gen;
             if (++ti->retries <= 16) return KERN_SUCCESS;
         }
         atomic_fetch_add(&tw_rt.n_violations, 1);

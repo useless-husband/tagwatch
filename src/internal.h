@@ -70,14 +70,17 @@ int tw_watch_remove_addr(uint64_t addr, const char *reason);
 // Marks the watch covering addr as freed (it stays armed). Returns 1 if found.
 int tw_watch_mark_freed(uint64_t addr);
 // Finds the watch hit by an access to [ea, ea+size) or, failing that, by the
-// fault address. Copies the record and bumps its counters.
-int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack);
+// fault address. Copies the record and bumps its counters. On a miss,
+// *tag_now (if not NULL) receives the current tag of the faulting granule.
+int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+                 unsigned *tag_now);
 // 1 if any granule of [addr, addr+len) is armed (cheap when nothing is).
 int tw_watch_overlaps(uint64_t addr, uint64_t len);
 // Restores the original tag of every armed granule (fork child).
 void tw_watch_disarm_all(void);
 void tw_watch_counts(uint64_t *live, uint64_t *total, uint64_t *granules);
 extern _Atomic uint64_t tw_armed_granules;
+extern _Atomic uint64_t tw_watch_generation; // bumped whenever a watch is armed or disarmed
 
 // ---- tramp.c: out-of-line execution slots ------------------------------------
 int tw_tramp_init(void);

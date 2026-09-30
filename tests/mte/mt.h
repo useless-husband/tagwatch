@@ -77,7 +77,7 @@ static inline void mt_start(const char *name) {
     // Allocated up front: the recorder runs on the handler thread and must not call malloc.
     mt_events = calloc(MT_MAX, sizeof *mt_events);
     tagwatch_set_callback(mt_record, NULL);
-    tagwatch_set_output(-1, NULL);
+    if (!getenv("MT_LOG")) tagwatch_set_output(-1, NULL); // MT_LOG=1 keeps the live log for debugging
 }
 
 static inline int mt_count(void) { return atomic_load(&mt_n); }

@@ -303,7 +303,7 @@ void tw_report_syscall(const char *name, uint64_t addr, uint64_t len, unsigned a
     tw_watch w;
     uint64_t slack = 0;
     atomic_fetch_add(&tw_rt.n_syscalls, 1);
-    if (!tw_watch_hit(addr, len, addr, access, &w, &slack) || slack || !(access & w.mode)) return;
+    if (!tw_watch_hit(addr, len, addr, access, &w, &slack, NULL) || slack || !(access & w.mode)) return;
     static _Atomic uint64_t sys_seq;
     tagwatch_event ev;
     memset(&ev, 0, sizeof ev);
