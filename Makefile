@@ -7,7 +7,7 @@ CFLAGS  += -std=c11 $(ARCH) $(WARN) -Iinclude
 B       := build
 
 # Logic that does not need MTE. Unit-tested on any arm64 Mac (and in CI).
-PURE    := fmt insn wtab spec
+PURE    := fmt insn wtab spec symtab
 UNIT    := $(PURE)
 
 .SECONDARY:
