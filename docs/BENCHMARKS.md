@@ -44,8 +44,8 @@ Both tools reporting the same number of true hits (20 and 3 768) is a check that
 **Hardware watchpoints.** `hw.optional.watchpoint` is the number of debug watchpoint registers the kernel exposes.
 `bench/hwwatch.c` sets one watchpoint on an 8-byte variable through `thread_set_state(ARM_DEBUG_STATE64)` and handles
 the resulting exceptions in-process (disable, single-step, re-enable), which is what a debugger does minus the
-debugger. In this configuration most hits are not delivered at all (the watchpoint silently stops firing until the
-thread's debug state is reloaded), so the program reports time per *delivered* hit and the count. It is included for
+debugger. In this configuration most hits are not delivered at all (the watchpoint stops firing for stretches; I did not
+find out why), so the program reports time per *delivered* hit and the count. It is included for
 completeness, not as a baseline. LLDB itself was not measured: it cannot launch processes on the development machine
 (Developer Mode is disabled and enabling it needs an administrator).
 
