@@ -21,8 +21,8 @@ CLI     := main report json
 UNIT    := fmt insn wtab spec symtab json report
 
 .SECONDARY:
-.PHONY: all unit mte-test test lint asan bench clean
-all: $(B)/libtagwatch.dylib $(B)/tagwatch
+.PHONY: all unit mte-test test lint asan bench examples clean
+all: $(B)/libtagwatch.dylib $(B)/tagwatch examples
 
 $(B)/obj $(B)/cli $(B)/unit $(B)/mte $(B)/examples $(B)/bench:
 	mkdir -p $@
@@ -42,6 +42,13 @@ $(B)/libtagwatch.dylib: $(RUNTIME:%=$(B)/obj/%.o)
 
 $(B)/tagwatch: $(CLI:%=$(B)/cli/%.o) $(B)/obj/fmt.o $(B)/obj/spec.o $(B)/obj/supervise.o
 	$(CC) $(ARCH) -o $@ $^ -lc++abi
+
+# ---- examples -------------------------------------------------------------------
+# Ordinary programs: no entitlements, no tagwatch headers.
+EXAMPLES := $(patsubst examples/%.c,$(B)/examples/%,$(wildcard examples/*.c))
+$(B)/examples/%: examples/%.c | $(B)/examples
+	$(CC) -O1 -g -fno-optimize-sibling-calls $(ARCH) -Wall -Wextra -o $@ $<
+examples: $(EXAMPLES)
 
 # ---- unit tests ---------------------------------------------------------------
 # The decoder's test vectors are assembled by the real assembler.

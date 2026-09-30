@@ -69,8 +69,11 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
                          const uint64_t *bt, unsigned nbt);
 int tw_watch_remove_id(tagwatch_id id, const char *reason);
 int tw_watch_remove_addr(uint64_t addr, const char *reason);
-// Marks the watch covering addr as freed (it stays armed). Returns 1 if found.
-int tw_watch_mark_freed(uint64_t addr);
+// Removes every watch intersecting [addr, addr+len); returns how many.
+int tw_watch_remove_range(uint64_t addr, uint64_t len, const char *reason);
+// Marks every watch intersecting [addr, addr+len) as freed (they stay armed,
+// to catch use-after-free). Returns how many.
+int tw_watch_mark_freed(uint64_t addr, uint64_t len);
 // Finds the watch hit by an access to [ea, ea+size) or, failing that, by the
 // fault address. Copies the record and bumps its counters. On a miss,
 // *tag_now (if not NULL) receives the current tag of the faulting granule.

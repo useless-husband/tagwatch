@@ -19,7 +19,9 @@ __attribute__((noinline)) static void *make_other(size_t n) {
 
 int main(void) {
     // Library-mode configuration comes from the environment, read by tagwatch_init().
-    setenv("TAGWATCH_WATCH", "alloc:size=777;alloc:size=600..700,caller=make_thing,label=thing;alloc:size=5000,every=3,skip=1,limit=2",
+    setenv("TAGWATCH_WATCH",
+           "alloc:size=777;alloc:size=600..700,caller=make_thing,label=thing;alloc:size=5000,every=3,skip=1,limit=2;"
+           "alloc:size=333,off=24,len=8,label=field",
            1);
     setenv("TAGWATCH_QUARANTINE", "4096", 1);
     mt_start("alloc");
@@ -94,6 +96,34 @@ int main(void) {
     CHECK_EQ(n_watched, 2);
     CHECK(watched_idx[0] == 1 && watched_idx[1] == 4);
     for (int i = 0; i < 8; i++) free(s[i]);
+
+    // --- one field of every matching object (off=24,len=8) ---------------------------------
+    mt_reset();
+    char *obj = malloc(333);
+    store8(obj + 23, 1); // the byte before the field: different granule half, not reported
+    store8(obj + 32, 1); // the byte after
+    CHECK_EQ(mt_count(), 0);
+    store8(obj + 24, 1);
+    store8(obj + 31, 1);
+    CHECK_EQ(mt_count(), 2);
+    CHECK(mt_last()->offset == 7 && mt_last()->watch_len == 8 && !strcmp(mt_last()->label, "field"));
+    free(obj); // freed while only an interior range is watched
+    (void)load8(obj + 24);
+    CHECK_EQ(mt_count(), 3);
+    CHECK(mt_last()->flags & TAGWATCH_EV_FREED);
+    // The same for a system-heap block with an interior watch set through the API.
+    char *sysblk = malloc(64);
+    CHECK(tagwatch_watch(sysblk + 40, 4, "interior") > 0);
+    free(sysblk);
+    tagwatch_get_stats(&st);
+    uint64_t live_before = st.watches_live;
+    sysblk = malloc(64); // may well be the same block again: it must not still be armed
+    mt_reset();
+    store8(sysblk + 40, 1);
+    CHECK_EQ(mt_count(), 0);
+    free(sysblk);
+    tagwatch_get_stats(&st);
+    CHECK(st.watches_live == live_before);
 
     // --- use after free -----------------------------------------------------------------------
     mt_reset();

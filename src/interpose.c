@@ -48,8 +48,14 @@ static inline int alloc_specs_active(void) { return tw_rt.have_alloc_specs && tw
 // A system-heap block that was watched in place must be disarmed before the
 // allocator sees it again: the allocator checks and rewrites tags itself.
 static inline void release_inplace_watch(void *p) {
-    if (p && atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) && tw_on() && !tw_arena_owns(p))
+    if (p && atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) && tw_on() && !tw_arena_owns(p)) {
+        // The allocator does not recognise a block whose first granule is
+        // retagged, so disarm that one first; then the block's size is known
+        // and watches on interior ranges can be found.
         tw_watch_remove_addr((uint64_t)(uintptr_t)p, "free");
+        size_t size = malloc_size(p);
+        if (size && tw_watch_overlaps((uint64_t)(uintptr_t)p, size)) tw_watch_remove_range((uint64_t)(uintptr_t)p, size, "free");
+    }
 }
 
 static void *tw_malloc(size_t size) {

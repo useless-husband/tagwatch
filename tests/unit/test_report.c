@@ -97,6 +97,7 @@ int main(void) {
     CHECK(strstr(out, "7 taken (1 not reported"));
     // Heat map of the 48-byte node: writes at +16 (twice) and +24, rw at +0.
     const char *heat = strstr(out, "Heat map of watch #1 \"node\" (48 bytes, 8 bytes per row)");
+    CHECK(strstr(out, "Watched objects\n"));
     CHECK(heat != NULL);
     if (heat) {
         CHECK(strstr(heat, "+0               1         1"));
@@ -120,12 +121,47 @@ int main(void) {
     feed(r, "{\"ev\":\"access\",\"seq\":4,\"kind\":\"write\",\"size\":1,\"addr\":\"0x5000\",\"watch\":999999999,\"off\":0,\"tid\":1,\"bt\":[]}");
     out = render(r);
     CHECK(strstr(out, "(top 1 of 2)"));
+    CHECK(strstr(out, "  2 watches  offsets +0..+16")); // watch 1 and the unknown id 999999999
     CHECK(strstr(out, "_ZN4Tree6insertEi") == NULL); // the C++ site is not the busiest
     CHECK(strstr(out, "+0               1         0"));
     CHECK(strstr(out, "+16              0         2"));
     tw_report_get_totals(r, &t);
     CHECK(!t.started);
     CHECK_EQ(t.accesses, 4);
+    tw_report_free(r);
+
+    // Many objects of one kind are summarised as a group, with a merged heat map.
+    tw_report_default_opts(&o);
+    o.heatmap = 1;
+    r = tw_report_new(&o);
+    for (int i = 1; i <= 40; i++) {
+        char line[512];
+        snprintf(line, sizeof line,
+                 "{\"ev\":\"watch\",\"id\":%d,\"base\":\"0x%x\",\"len\":16,\"origin\":\"alloc\",\"label\":\"node\","
+                 "\"bt\":[{\"pc\":\"0x10\",\"sym\":\"make_node\",\"off\":32,\"img\":\"demo\"}]}",
+                 i, 0x1000 + i * 32);
+        feed(r, line);
+        for (int k = 0; k < (i == 7 ? 5 : i <= 30 ? 1 : 0); k++) {
+            snprintf(line, sizeof line,
+                     "{\"ev\":\"access\",\"seq\":1,\"kind\":\"write\",\"size\":8,\"addr\":\"0x0\",\"watch\":%d,\"off\":8,\"tid\":1,"
+                     "\"bt\":[{\"pc\":\"0x20\",\"sym\":\"f\",\"off\":4,\"img\":\"demo\"}]}",
+                     i);
+            feed(r, line);
+        }
+        if (i % 2 == 0) {
+            snprintf(line, sizeof line, "{\"ev\":\"free\",\"id\":%d}", i);
+            feed(r, line);
+        }
+    }
+    feed(r, "{\"ev\":\"watch\",\"id\":41,\"base\":\"0x9000\",\"len\":8,\"origin\":\"symbol\",\"label\":\"g\"}");
+    out = render(r);
+    CHECK(strstr(out, "40 objects, 16 bytes each \"node\", allocated by make_node+0x20 (demo)"));
+    CHECK(strstr(out, "0 reads, 34 writes; 20 freed; 10 never accessed"));
+    CHECK(strstr(out, "busiest: #7 (5) #1 (1)"));
+    CHECK(strstr(out, "#41   8 bytes at 0x9000 \"g\""));
+    CHECK(strstr(out, "34  write 8 bytes  30 watches (\"node\", ...)  offset +8"));
+    CHECK(strstr(out, "Heat map of 40 objects \"node\" (16 bytes each, 8 bytes per row)"));
+    CHECK(strstr(out, "+8               0        34"));
     tw_report_free(r);
 
     // An empty trace prints a well-formed, empty summary.

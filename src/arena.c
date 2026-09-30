@@ -182,7 +182,9 @@ void tw_arena_free(void *p) {
 
     // A watched block goes to quarantine still armed; anything that touches
     // it from now on is reported as a use-after-free.
-    if (q_limit && tw_on() && tw_watch_mark_freed(payload)) {
+    uint64_t span = (h->size + TW_GRANULE_MASK) & ~TW_GRANULE_MASK;
+    if (span == 0) span = TW_GRANULE;
+    if (q_limit && tw_on() && tw_watch_mark_freed(payload, span)) {
         os_unfair_lock_lock(&lock);
         if (q_count < QUEUE) {
             quarantine[(q_head + q_count++) % QUEUE] = payload;
@@ -201,8 +203,11 @@ void tw_arena_free(void *p) {
     }
     if (!quarantined) evict[n_evict++] = payload;
     for (unsigned i = 0; i < n_evict; i++) {
-        // Disarm outside the arena lock (the watch module has its own).
-        if (tw_on()) tw_watch_remove_addr(evict[i], evict[i] == payload && !quarantined ? "free" : "quarantine-evict");
+        // Disarm outside the arena lock (the watch module has its own). A
+        // block may carry several watches (fields watched separately).
+        hdr_t *eh = (hdr_t *)(uintptr_t)(evict[i] - HDR);
+        uint64_t elen = (eh->size + TW_GRANULE_MASK) & ~TW_GRANULE_MASK;
+        if (tw_on()) tw_watch_remove_range(evict[i], elen ? elen : TW_GRANULE, evict[i] == payload && !quarantined ? "free" : "quarantine-evict");
         os_unfair_lock_lock(&lock);
         block_put(evict[i]);
         os_unfair_lock_unlock(&lock);

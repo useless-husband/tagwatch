@@ -102,12 +102,12 @@ int tw_spec_parse(const char *text, size_t n, tw_spec *s, char *err, size_t errl
             bad = copy_name(s->name, sizeof s->name, v, vn);
         } else if (s->kind == TW_SPEC_SYMBOL && key_is(k, kn, "image")) {
             bad = copy_name(s->image, sizeof s->image, v, vn);
-        } else if (s->kind == TW_SPEC_SYMBOL && key_is(k, kn, "off")) {
+        } else if (s->kind != TW_SPEC_ADDR && key_is(k, kn, "off")) {
             bad = tw_parse_u64(v, vn, &s->off) != 0;
         } else if (s->kind == TW_SPEC_ADDR && key_is(k, kn, "base")) {
             bad = tw_parse_u64(v, vn, &s->base) != 0;
             have_base = 1;
-        } else if (s->kind != TW_SPEC_ALLOC && key_is(k, kn, "len")) {
+        } else if (key_is(k, kn, "len")) {
             bad = tw_parse_u64(v, vn, &s->len) != 0 || s->len == 0;
             have_len = 1;
         } else {
@@ -138,8 +138,9 @@ int tw_spec_format(const tw_spec *s, char *buf, size_t cap) {
             if (s->size_max != UINT64_MAX) tw_put_dec(&b, s->size_max);
         }
         if (s->caller[0]) tw_put_fmt(&b, ",caller=%s", s->caller);
-        tw_put_fmt(&b, ",depth=%u,every=%llu,skip=%llu,limit=%llu", s->depth, (unsigned long long)s->every,
-                   (unsigned long long)s->skip, (unsigned long long)s->limit);
+        tw_put_fmt(&b, ",depth=%u,every=%llu,skip=%llu,limit=%llu,off=%llu", s->depth, (unsigned long long)s->every,
+                   (unsigned long long)s->skip, (unsigned long long)s->limit, (unsigned long long)s->off);
+        if (s->len) tw_put_fmt(&b, ",len=%llu", (unsigned long long)s->len);
         break;
     case TW_SPEC_SYMBOL:
         tw_put_fmt(&b, "symbol:name=%s", s->name);

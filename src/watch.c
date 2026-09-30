@@ -169,17 +169,42 @@ int tw_watch_remove_addr(uint64_t addr, const char *reason) {
     return slot ? remove_slot(slot, 0, reason) : -TAGWATCH_ENOENT;
 }
 
-int tw_watch_mark_freed(uint64_t addr) {
+// Removes every watch that intersects [addr, addr+len). Returns how many.
+int tw_watch_remove_range(uint64_t addr, uint64_t len, const char *reason) {
+    int n = 0;
+    addr &= TW_ADDR_MASK;
+    for (;;) {
+        os_unfair_lock_lock(&lock);
+        uint32_t slot = tw_wtab_find(&table, addr, len, NULL);
+        os_unfair_lock_unlock(&lock);
+        if (!slot) return n;
+        if (remove_slot(slot, 0, reason) == 0) n++;
+    }
+}
+
+// Marks every watch intersecting [addr, addr+len) as freed (they stay
+// armed). Returns how many.
+int tw_watch_mark_freed(uint64_t addr, uint64_t len) {
+    uint64_t serials[16];
+    int n = 0;
+    addr &= TW_ADDR_MASK;
+    uint64_t end = addr + len;
     os_unfair_lock_lock(&lock);
-    uint32_t slot = tw_wtab_get(&table, addr & TW_ADDR_MASK, NULL);
-    uint64_t serial = 0;
-    if (slot) {
-        slot_ptr(slot)->flags |= TW_WF_FREED;
-        serial = slot_ptr(slot)->serial;
+    while (addr < end) {
+        uint64_t hit = 0;
+        uint32_t slot = tw_wtab_find(&table, addr, end - addr, &hit);
+        if (!slot) break;
+        tw_watch *w = slot_ptr(slot);
+        if (!(w->flags & TW_WF_FREED)) {
+            w->flags |= TW_WF_FREED;
+            if (n < 16) serials[n] = w->serial;
+            n++;
+        }
+        addr = w->gbase + w->glen; // continue after this watch
     }
     os_unfair_lock_unlock(&lock);
-    if (slot) tw_emit_freed(serial);
-    return slot != 0;
+    for (int i = 0; i < n && i < 16; i++) tw_emit_freed(serials[i]);
+    return n;
 }
 
 int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,

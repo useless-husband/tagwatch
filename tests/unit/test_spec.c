@@ -28,6 +28,7 @@ int main(void) {
     CHECK(parse("alloc:size=4k..", &s) == 0 && s.size_min == 4096 && s.size_max == UINT64_MAX);
     CHECK(parse("alloc:size=..64", &s) == 0 && s.size_min == 0 && s.size_max == 64);
     CHECK(parse("alloc:caller=operator_new", &s) == 0 && s.size_min == 0 && s.size_max == UINT64_MAX);
+    CHECK(parse("alloc:caller=customer_new,off=16,len=8", &s) == 0 && s.off == 16 && s.len == 8);
 
     CHECK(parse("symbol:name=g_table", &s) == 0 && s.kind == TW_SPEC_SYMBOL && s.len == 0);
     CHECK(parse("symbol:name=g_table,len=64,off=8,image=libfoo.dylib,rw=r", &s) == 0);
@@ -56,6 +57,7 @@ int main(void) {
     CHECK(strstr(parse_err("symbol:name=x,len=0"), "bad value"));
     CHECK(strstr(parse_err("symbol:name=x,size=4"), "unknown key"));
     CHECK(strstr(parse_err("addr:base=0x1000"), "needs base= and len="));
+    CHECK(strstr(parse_err("addr:base=0x1000,len=8,off=4"), "unknown key"));
     CHECK(strstr(parse_err("addr:base=0xfffffffffffffff0,len=32"), "wraps"));
     char longname[300];
     memset(longname, 'a', sizeof longname);
@@ -93,6 +95,8 @@ int main(void) {
             a.every = 1 + t_rand(&st) % 1000;
             a.skip = t_rand(&st) % 1000;
             a.limit = t_rand(&st) % 1000;
+            a.off = t_rand(&st) % 64;
+            a.len = t_rand(&st) % 64;
         } else if (a.kind == TW_SPEC_SYMBOL) {
             strcpy(a.name, names[t_rand(&st) % 5]);
             if (t_rand(&st) & 1) strcpy(a.image, names[t_rand(&st) % 5]);

@@ -2,6 +2,7 @@
 //
 //   alloc:size=48,caller=make_node,depth=4,every=1,skip=0,limit=0,rw=rw,label=x
 //   alloc:size=32..128            (inclusive range; "64.." is open-ended)
+//   alloc:caller=new_node,off=16,len=8   (one field of every such object)
 //   symbol:name=g_table,len=64,off=0,image=libfoo.dylib
 //   addr:base=0x100008000,len=16
 //
@@ -30,9 +31,9 @@ typedef struct {
     // symbol
     char name[TW_SPEC_NAME_MAX];
     char image[TW_SPEC_NAME_MAX]; // "" = main executable
+    // alloc and symbol: watch [off, off+len) of the object; len 0 = to its end
     uint64_t off;
-    // symbol and addr
-    uint64_t base, len; // symbol: len 0 = up to the next symbol
+    uint64_t base, len; // addr: the range itself
 } tw_spec;
 
 // Parses one spec. Returns 0, or -1 with a message in err.

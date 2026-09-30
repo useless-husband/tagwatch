@@ -32,8 +32,9 @@ typedef struct site {
     uint64_t size_min, size_max;
     int64_t off_min, off_max;
     int64_t first_watch;
-    uint64_t n_watches; // distinct watches hit (exact while small)
-    int64_t watches[8];
+    uint64_t n_watches; // distinct watches hit
+    int64_t *wset;      // open-addressing set of watch ids (0 = empty)
+    size_t wset_cap;
     uint64_t tids[8];
     int n_tids;
     int after_free, by_kernel;
@@ -93,7 +94,7 @@ void tw_report_free(tw_report *r) {
         for (site_t *s = r->buckets[b], *n; s; s = n) {
             n = s->next;
             for (int i = 0; i < s->nframes; i++) free(s->frames[i]);
-            free(s->key), free(s->syscall), free(s);
+            free(s->key), free(s->syscall), free(s->wset), free(s);
         }
     for (int i = 0; i < 16; i++) {
         free(r->violations[i].kind), free(r->violations[i].addr);
@@ -148,6 +149,31 @@ static void note_tid(uint64_t *set, int *n, int cap, uint64_t tid) {
     for (int i = 0; i < *n; i++)
         if (set[i] == tid) return;
     if (*n < cap) set[(*n)++] = tid;
+}
+
+// Adds id to the site's set of watches; returns 1 if it was new.
+static int site_add_watch(site_t *s, int64_t id) {
+    if (id <= 0) return 0;
+    if ((s->n_watches + 1) * 2 > s->wset_cap) {
+        size_t ncap = s->wset_cap ? s->wset_cap * 2 : 8;
+        int64_t *ns = calloc(ncap, sizeof *ns);
+        if (!ns) return 0;
+        for (size_t i = 0; i < s->wset_cap; i++)
+            if (s->wset[i]) {
+                size_t j = (size_t)((uint64_t)s->wset[i] * 0x9e3779b97f4a7c15ull >> 32) & (ncap - 1);
+                while (ns[j]) j = (j + 1) & (ncap - 1);
+                ns[j] = s->wset[i];
+            }
+        free(s->wset);
+        s->wset = ns;
+        s->wset_cap = ncap;
+    }
+    size_t j = (size_t)((uint64_t)id * 0x9e3779b97f4a7c15ull >> 32) & (s->wset_cap - 1);
+    while (s->wset[j] && s->wset[j] != id) j = (j + 1) & (s->wset_cap - 1);
+    if (s->wset[j] == id) return 0;
+    s->wset[j] = id;
+    s->n_watches++;
+    return 1;
 }
 
 static void heat_add(const tw_report *r, watch_t *w, const char *kind, int64_t off, uint64_t size) {
@@ -242,12 +268,7 @@ static void feed_access(tw_report *r, const jval *o) {
     if (off < s->off_min) s->off_min = off;
     if (off > s->off_max) s->off_max = off;
     note_tid(s->tids, &s->n_tids, 8, tid);
-    int known = 0;
-    for (uint64_t i = 0; i < s->n_watches && i < 8; i++) known |= s->watches[i] == id;
-    if (!known) {
-        if (s->n_watches < 8) s->watches[s->n_watches] = id;
-        s->n_watches++; // beyond 8 this over-counts repeats; printed as "8+"
-    }
+    site_add_watch(s, id);
 }
 
 int tw_report_feed(tw_report *r, char *line) {
@@ -355,36 +376,66 @@ static int watch_by_total_desc(const void *a, const void *b) {
     return x->id < y->id ? -1 : x->id > y->id;
 }
 
+static int same_group(const watch_t *a, const watch_t *b) {
+    return a->len == b->len && !strcmp(a->label, b->label) && !strcmp(a->site ? a->site : "", b->site ? b->site : "");
+}
+
+// Groups together, busiest object first inside a group, groups in order of
+// their first (lowest) watch id so the listing is stable.
+static int watch_by_group_then_total(const void *a, const void *b) {
+    const watch_t *x = *(watch_t *const *)a, *y = *(watch_t *const *)b;
+    if (!same_group(x, y)) {
+        int c = strcmp(x->label, y->label);
+        if (!c) c = strcmp(x->site ? x->site : "", y->site ? y->site : "");
+        if (!c) c = x->len < y->len ? -1 : 1;
+        return c;
+    }
+    return watch_by_total_desc(a, b);
+}
+
 static void print_bar(FILE *out, uint64_t v, uint64_t max) {
     int n = max ? (int)((v * 40 + max - 1) / max) : 0;
     for (int i = 0; i < n; i++) fputc('#', out);
 }
 
-static void print_heat(const tw_report *r, const watch_t *w, FILE *out) {
-    if (!w->heat_r || !w->heat_w) return;
-    uint64_t row_bytes = (w->len + w->heat_rows - 1) / w->heat_rows, max = 0;
-    if (row_bytes < (uint64_t)r->opts.heat_bytes) row_bytes = (uint64_t)r->opts.heat_bytes;
-    for (uint32_t i = 0; i < w->heat_rows; i++) {
-        uint64_t v = (uint64_t)w->heat_r[i] + w->heat_w[i];
-        if (v > max) max = v;
+// Heat map of a group of objects with the same layout, counters summed.
+static void print_heat(const tw_report *r, watch_t *const *group, size_t n, FILE *out) {
+    const watch_t *w0 = group[0];
+    uint32_t rows = 0;
+    for (size_t i = 0; i < n; i++)
+        if (group[i]->heat_r && group[i]->heat_w && group[i]->heat_rows > rows) rows = group[i]->heat_rows;
+    if (!rows) return;
+    uint64_t *hr = calloc(rows, sizeof *hr), *hw = calloc(rows, sizeof *hw);
+    if (!hr || !hw) {
+        free(hr), free(hw);
+        return;
     }
-    fprintf(out, "\nHeat map of watch #%lld", (long long)w->id);
-    if (w->label[0]) fprintf(out, " \"%s\"", w->label);
-    fprintf(out, " (%llu bytes, %llu bytes per row)\n", (unsigned long long)w->len, (unsigned long long)row_bytes);
+    for (size_t i = 0; i < n; i++)
+        for (uint32_t k = 0; group[i]->heat_r && group[i]->heat_w && k < group[i]->heat_rows; k++)
+            hr[k] += group[i]->heat_r[k], hw[k] += group[i]->heat_w[k];
+    uint64_t row_bytes = (w0->len + rows - 1) / rows, max = 0;
+    if (row_bytes < (uint64_t)r->opts.heat_bytes) row_bytes = (uint64_t)r->opts.heat_bytes;
+    for (uint32_t i = 0; i < rows; i++)
+        if (hr[i] + hw[i] > max) max = hr[i] + hw[i];
+    if (n == 1) fprintf(out, "\nHeat map of watch #%lld", (long long)w0->id);
+    else fprintf(out, "\nHeat map of %zu objects", n);
+    if (w0->label[0]) fprintf(out, " \"%s\"", w0->label);
+    fprintf(out, " (%llu bytes%s, %llu bytes per row)\n", (unsigned long long)w0->len, n == 1 ? "" : " each", (unsigned long long)row_bytes);
     fprintf(out, "    offset       reads    writes\n");
     uint32_t skipped = 0;
-    for (uint32_t i = 0; i < w->heat_rows; i++) {
-        if (!w->heat_r[i] && !w->heat_w[i]) { // collapse runs of untouched rows
+    for (uint32_t i = 0; i < rows; i++) {
+        if (!hr[i] && !hw[i]) { // collapse runs of untouched rows
             skipped++;
             continue;
         }
         if (skipped) fprintf(out, "    ...          (%u untouched row%s)\n", skipped, skipped == 1 ? "" : "s");
         skipped = 0;
-        fprintf(out, "    +%-8llu %8u  %8u  ", (unsigned long long)(i * row_bytes), w->heat_r[i], w->heat_w[i]);
-        print_bar(out, (uint64_t)w->heat_r[i] + w->heat_w[i], max);
+        fprintf(out, "    +%-8llu %8llu  %8llu  ", (unsigned long long)(i * row_bytes), (unsigned long long)hr[i], (unsigned long long)hw[i]);
+        print_bar(out, hr[i] + hw[i], max);
         fputc('\n', out);
     }
     if (skipped) fprintf(out, "    ...          (%u untouched row%s)\n", skipped, skipped == 1 ? "" : "s");
+    free(hr), free(hw);
 }
 
 void tw_report_print(const tw_report *r, FILE *out) {
@@ -408,38 +459,54 @@ void tw_report_print(const tw_report *r, FILE *out) {
     if (t->violations) fprintf(out, "VIOLATIONS %llu MTE tag-check faults that were not watchpoints (see below)\n", (unsigned long long)t->violations);
     if (t->bad_lines) fprintf(out, "warning    %llu unreadable trace lines were skipped\n", (unsigned long long)t->bad_lines);
 
-    // Watched objects.
+    // Watched objects. Objects that share a label, a size and an allocation
+    // site are one line: a thousand list nodes are not a thousand stories.
     size_t nw = 0;
     watch_t **ws = calloc(r->n_watches_cap + 1, sizeof *ws);
     if (!ws) return;
     for (size_t i = 0; i < r->n_watches_cap; i++)
         if (r->watches[i].seen) ws[nw++] = &r->watches[i];
-    qsort(ws, nw, sizeof *ws, watch_by_total_desc);
-    if (nw) {
-        size_t shown = nw > 12 ? 12 : nw;
-        fprintf(out, "\nWatched objects, busiest first%s\n", nw > shown ? " (top 12)" : "");
-        for (size_t i = 0; i < shown; i++) {
-            const watch_t *w = ws[i];
-            fprintf(out, "  #%-4lld %llu bytes at 0x%llx", (long long)w->id, (unsigned long long)w->len, (unsigned long long)w->base);
-            if (w->label[0]) fprintf(out, " \"%s\"", w->label);
-            if (w->site) fprintf(out, ", allocated by %s", w->site);
-            fprintf(out, "\n        %llu reads, %llu writes", (unsigned long long)w->reads, (unsigned long long)w->writes);
-            if (w->rw) fprintf(out, ", %llu read-modify-writes", (unsigned long long)w->rw);
-            if (w->by_kernel) fprintf(out, ", %llu by the kernel", (unsigned long long)w->by_kernel);
-            if (w->after_free) fprintf(out, ", %llu AFTER FREE", (unsigned long long)w->after_free);
+    qsort(ws, nw, sizeof *ws, watch_by_group_then_total);
+    if (nw) fprintf(out, "\nWatched objects\n");
+    size_t groups_shown = 0;
+    for (size_t i = 0; i < nw;) {
+        size_t j = i;
+        uint64_t reads = 0, writes = 0, rw = 0, freed = 0, after_free = 0, by_kernel = 0, idle = 0;
+        while (j < nw && same_group(ws[i], ws[j])) {
+            reads += ws[j]->reads, writes += ws[j]->writes, rw += ws[j]->rw;
+            freed += ws[j]->freed != 0, after_free += ws[j]->after_free, by_kernel += ws[j]->by_kernel;
+            idle += watch_total(ws[j]) == 0;
+            j++;
+        }
+        size_t n = j - i;
+        const watch_t *w = ws[i];
+        if (groups_shown++ == 20) {
+            fprintf(out, "  ... (more groups not shown)\n");
+            break;
+        }
+        if (n == 1) fprintf(out, "  #%-4lld %llu bytes at 0x%llx", (long long)w->id, (unsigned long long)w->len, (unsigned long long)w->base);
+        else fprintf(out, "  %zu objects, %llu bytes each", n, (unsigned long long)w->len);
+        if (w->label[0]) fprintf(out, " \"%s\"", w->label);
+        if (w->site) fprintf(out, ", allocated by %s", w->site);
+        fprintf(out, "\n        %llu reads, %llu writes", (unsigned long long)reads, (unsigned long long)writes);
+        if (rw) fprintf(out, ", %llu read-modify-writes", (unsigned long long)rw);
+        if (by_kernel) fprintf(out, ", %llu by the kernel", (unsigned long long)by_kernel);
+        if (after_free) fprintf(out, ", %llu AFTER FREE", (unsigned long long)after_free);
+        if (n == 1) {
             if (w->freed) fprintf(out, "; freed");
             else if (!w->live && w->end_reason) fprintf(out, "; ended: %s", w->end_reason);
+        } else {
+            if (freed) fprintf(out, "; %llu freed", (unsigned long long)freed);
+            if (idle) fprintf(out, "; %llu never accessed", (unsigned long long)idle);
+        }
+        fputc('\n', out);
+        if (n > 1) { // within a group the busiest objects come first
+            fprintf(out, "        busiest:");
+            for (size_t k = i; k < j && k < i + 6; k++)
+                fprintf(out, " #%lld (%llu)", (long long)ws[k]->id, (unsigned long long)watch_total(ws[k]));
             fputc('\n', out);
         }
-        if (nw > shown) {
-            uint64_t rest = 0, idle = 0;
-            for (size_t i = shown; i < nw; i++) {
-                rest += watch_total(ws[i]);
-                idle += watch_total(ws[i]) == 0;
-            }
-            fprintf(out, "  ... and %zu more objects with %llu accesses in total (%llu never accessed)\n", nw - shown,
-                    (unsigned long long)rest, (unsigned long long)idle);
-        }
+        i = j;
     }
 
     // Access sites.
@@ -466,7 +533,7 @@ void tw_report_print(const tw_report *r, FILE *out) {
                 fprintf(out, "  watch #%lld", (long long)w->id);
                 if (w->label[0]) fprintf(out, " \"%s\"", w->label);
             } else {
-                fprintf(out, "  %llu%s watches", (unsigned long long)(s->n_watches > 8 ? 8 : s->n_watches), s->n_watches > 8 ? "+" : "");
+                fprintf(out, "  %llu watches", (unsigned long long)s->n_watches);
                 if (w && w->seen && w->label[0]) fprintf(out, " (\"%s\", ...)", w->label);
             }
             if (s->off_min == s->off_max) fprintf(out, "  offset %+lld", (long long)s->off_min);
@@ -479,8 +546,16 @@ void tw_report_print(const tw_report *r, FILE *out) {
         }
     }
 
-    if (r->opts.heatmap)
-        for (size_t i = 0; i < nw && i < 12; i++) print_heat(r, ws[i], out);
+    if (r->opts.heatmap) {
+        size_t maps = 0;
+        for (size_t i = 0; i < nw && maps < 12;) {
+            size_t j = i;
+            while (j < nw && same_group(ws[i], ws[j])) j++;
+            print_heat(r, &ws[i], j - i, out);
+            maps++;
+            i = j;
+        }
+    }
 
     for (uint64_t i = 0; i < t->violations && i < 16; i++) {
         const violation_t *v = &r->violations[i];

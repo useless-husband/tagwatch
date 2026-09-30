@@ -295,7 +295,10 @@ void *tw_alloc_watched(size_t size, size_t align, int spec_idx, const void *fram
     uint64_t bt[TW_ALLOC_BT];
     unsigned n = tw_backtrace_fp(frame, bt, TW_ALLOC_BT);
     const char *label = s->label[0] ? s->label : s->caller; // may be empty
-    tw_watch_add((uint64_t)(uintptr_t)p, size ? size : 1, label, s->mode, TW_ORIGIN_ALLOC, bt, n);
+    // off=/len= narrow the watch to one field of the object.
+    uint64_t total = size ? size : 1, off = s->off < total ? s->off : 0;
+    uint64_t len = s->len && s->len < total - off ? s->len : total - off;
+    tw_watch_add((uint64_t)(uintptr_t)p + off, len, label, s->mode, TW_ORIGIN_ALLOC, bt, n);
     return p;
 }
 
