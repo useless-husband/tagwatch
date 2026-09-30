@@ -4,11 +4,12 @@
 #   make test       unit tests, then the MTE tests (skipped without MTE)
 #   make unit       unit tests only (what CI runs)
 #   make lint       warnings-as-errors build plus the clang static analyzer
-#   make asan       unit tests under AddressSanitizer and UBSan
+#   make sanitize   unit tests under UBSan (SAN=address,undefined adds ASan)
 #   make bench      measurements used in the README (needs MTE)
 CC      ?= clang
 ARCH    := -arch arm64
-WARN    := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wconversion -Wno-sign-conversion -Werror
+WERROR  ?= -Werror
+WARN    := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wconversion -Wno-sign-conversion $(WERROR)
 OPT     ?= -O2 -g
 CFLAGS  := $(OPT) -std=c11 $(ARCH) $(WARN) -Iinclude -fvisibility=hidden $(EXTRA_CFLAGS)
 B       ?= build
@@ -21,7 +22,8 @@ CLI     := main report json
 UNIT    := fmt insn wtab spec symtab json report
 
 .SECONDARY:
-.PHONY: all unit mte-test test lint asan bench bench-build examples clean
+comma := ,
+.PHONY: all unit mte-test test lint sanitize bench bench-build examples clean
 all: $(B)/libtagwatch.dylib $(B)/tagwatch examples
 
 $(B)/obj $(B)/cli $(B)/unit $(B)/mte $(B)/examples $(B)/bench:
@@ -73,7 +75,7 @@ MTE_TESTS := $(patsubst tests/mte/%.c,%,$(wildcard tests/mte/t_*.c))
 # Library-mode tests link the dylib and carry the hardened-process
 # entitlements, which is what enables MTE for a binary started directly.
 $(B)/mte/t_%: tests/mte/t_%.c tests/mte/mt.h $(B)/libtagwatch.dylib $(ENT) | $(B)/mte
-	$(CC) $(OPT) -std=c11 $(ARCH) -Wall -Wextra -Werror -Iinclude -o $@ $< -L$(B) -ltagwatch -lz -Wl,-rpath,@executable_path/..
+	$(CC) $(OPT) -std=c11 $(ARCH) -Wall -Wextra $(WERROR) -Iinclude -o $@ $< -L$(B) -ltagwatch -lz -Wl,-rpath,@executable_path/..
 	codesign -s - --entitlements $(ENT) -f $@ 2>/dev/null
 
 # Plain, unsigned-for-MTE targets for `tagwatch run`.
@@ -111,13 +113,17 @@ bench: bench-build
 
 # ---- quality gates ---------------------------------------------------------------
 lint:
-	$(MAKE) B=$(B)/lint OPT="-O1 -g" all unit
+	$(MAKE) B=$(B)/lint OPT="-O1 -g" all
 	$(CC) --analyze -Xanalyzer -analyzer-output=text $(ARCH) -std=c11 -Iinclude \
 	    src/fmt.c src/insn.c src/wtab.c src/spec.c src/symtab.c src/watch.c src/bt.c src/trace.c src/tramp.c src/exc.c \
 	    src/arena.c src/adopt.c src/supervise.c src/runtime.c src/vm.c cli/json.c cli/report.c cli/main.c
 
-asan:
-	$(MAKE) B=$(B)/asan OPT="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined" unit
+# SAN=address,undefined in CI. (On the macOS 27 beta used for development
+# the ASan runtime of the Command Line Tools hangs in its own start-up, even
+# for an empty program, so the local default is UBSan alone.)
+SAN ?= undefined
+sanitize:
+	$(MAKE) B=$(B)/san-$(subst $(comma),-,$(SAN)) OPT="-O1 -g -fsanitize=$(SAN) -fno-sanitize-recover=undefined" unit
 
 clean:
 	rm -rf $(B)

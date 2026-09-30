@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and CPU
+        run: |
+          clang --version
+          sysctl -n machdep.cpu.brand_string
+          sysctl hw.optional.arm.FEAT_MTE || echo "hw.optional.arm.FEAT_MTE: not present"
+
+      - name: Build
+        run: make -j4 all bench-build
+
+      - name: Unit tests
+        run: make unit
+
+      - name: Unit tests under AddressSanitizer and UBSan
+        run: make sanitize SAN=address,undefined
+
+      - name: Static analysis
+        run: make lint
+
+      # GitHub-hosted runners have no MTE (they are M1/M2 machines), so this
+      # step builds the MTE tests and then reports them as skipped, with the
+      # reason. They are run on an M5; the README shows that run.
+      - name: MTE tests (skipped without MTE hardware)
+        run: make mte-test
+
+      - name: CLI smoke test
+        run: |
+          build/tagwatch --version
+          build/tagwatch --help > /dev/null
+          build/tagwatch check || echo "(expected on a runner without MTE)"
+          printf '%s\n' '{"ev":"start","pid":1,"exe":"/x"}' '{"ev":"watch","id":1,"base":"0x10","len":8,"origin":"api","label":"v"}' \
+            '{"ev":"access","seq":1,"kind":"write","size":8,"addr":"0x10","watch":1,"off":0,"tid":1,"bt":[{"pc":"0x1","sym":"f","off":4,"img":"x"}]}' > trace.jsonl
+          build/tagwatch report --heatmap trace.jsonl | tee report.txt
+          grep -q '1 reported: 0 read, 1 write' report.txt

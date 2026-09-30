@@ -146,13 +146,19 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     char *insert = NULL;
     for (size_t i = 0; i < n_env; i++) {
         if (lib && !strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22)) {
-            if (asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s:%s", lib, environ[i] + 22) < 0) return -1;
+            if (asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s:%s", lib, environ[i] + 22) < 0) {
+                free(env);
+                return -1;
+            }
             continue;
         }
         if (!strncmp(environ[i], "TAGWATCH_", 9)) continue; // only what this invocation asks for
         env[k++] = environ[i];
     }
-    if (lib && !insert && asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s", lib) < 0) return -1;
+    if (lib && !insert && asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s", lib) < 0) {
+        free(env);
+        return -1;
+    }
     if (insert) env[k++] = insert;
     for (int i = 0; lib && i < n_extra; i++) env[k++] = extra_env[i];
     env[k] = NULL;

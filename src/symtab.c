@@ -162,6 +162,7 @@ static int usable_sym(const struct nlist_64 *n) {
 static const char *nearest(const image_t *im, uint64_t pc, uint64_t *addr) {
     uint64_t target = pc - im->slide, best = 0;
     const char *name = NULL;
+    if (!im->syms || !im->strs) return NULL;
     for (uint32_t i = 0; i < im->nsyms; i++) {
         const struct nlist_64 *n = &im->syms[i];
         if (!usable_sym(n) || n->n_value > target || n->n_value < best) continue;
@@ -248,6 +249,7 @@ int tw_sym_find(const char *image, const char *name, uint64_t *addr, uint64_t *s
     for (int i = 0; i < n_images && !found; i++) {
         const image_t *im = &images[i];
         if (image && image[0] ? strcmp(im->base, image) != 0 : !im->is_main) continue;
+        if (!im->syms || !im->strs) continue;
         for (uint32_t k = 0; k < im->nsyms; k++) {
             const struct nlist_64 *n = &im->syms[k];
             if (!usable_sym(n) || n->n_un.n_strx >= im->strsize) continue;

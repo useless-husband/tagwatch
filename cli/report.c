@@ -233,7 +233,10 @@ static void feed_access(tw_report *r, const jval *o) {
     size_t klen = 32;
     for (int i = 0; i < nf; i++) klen += strlen(frames[i]) + 1;
     char *key = malloc(klen);
-    if (!key) return;
+    if (!key) {
+        for (int i = 0; i < nf; i++) free(frames[i]);
+        return;
+    }
     size_t at = (size_t)snprintf(key, klen, "%s|%d|%s", kind, after_free, syscall ? syscall : "");
     for (int i = 0; i < nf; i++) at += (size_t)snprintf(key + at, klen - at, "|%s", frames[i]);
 
