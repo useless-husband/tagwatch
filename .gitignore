@@ -1,0 +1,7 @@
+build/
+*.dSYM/
+*.o
+*.dylib
+.DS_Store
+*.jsonl
+!docs/samples/*.jsonl
