@@ -124,7 +124,8 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     }
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    if (set_shims(&attr, 1) != 0) {
+    // Flags 0: the same call LLDB's `process launch --memory-tagging` makes.
+    if (set_shims(&attr, 0) != 0) {
         fprintf(stderr, "tagwatch: " SHIM_SPI " failed\n");
         return -1;
     }
