@@ -22,6 +22,7 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 
 #include "internal.h"
@@ -53,6 +54,7 @@ static pool_t pools[MAX_POOLS];
 static int n_pools;
 static map_t *map;
 static size_t map_cap, map_used;
+static int force_far; // TAGWATCH_FORCE_FAR=1: always return through BRK (tests, benchmarks)
 
 static size_t map_bucket(uint64_t pc) { return (size_t)(((pc >> 2) * 0x9e3779b97f4a7c15ull) >> 32) & (map_cap - 1); }
 
@@ -79,6 +81,8 @@ static void *map_jit(uint64_t hint) {
 }
 
 int tw_tramp_init(void) {
+    const char *ff = getenv("TAGWATCH_FORCE_FAR");
+    force_far = ff && ff[0] == '1';
     if (map_grow() != 0) return -1;
     // Fail early if this process may not create JIT memory (hardened runtime
     // without the allow-jit entitlement).
@@ -183,7 +187,7 @@ uint64_t tw_tramp_get(uint64_t pc, uint32_t insn, int *far) {
         while (map[i].pc) i = (i + 1) & (map_cap - 1);
     }
     int is_far = 0;
-    pool_t *p = pool_near(pc);
+    pool_t *p = force_far ? NULL : pool_near(pc);
     if (!p) {
         p = pool_any();
         is_far = 1;

@@ -14,6 +14,7 @@
 // read() below are the real ones.
 #include <errno.h>
 #include <malloc/malloc.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,3 +263,68 @@ INTERPOSE(tw_pwrite, pwrite);
 INTERPOSE(tw_send, send);
 INTERPOSE(tw_fread, fread);
 INTERPOSE(tw_fwrite, fwrite);
+
+// ---- signal handlers ------------------------------------------------------------
+// PSTATE.TCO is inherited by a signal handler. If a signal lands on a thread
+// that is inside an execution slot (tag checks off for one instruction), the
+// whole handler would run unchecked and its accesses to watched memory would
+// go unreported. Handlers are therefore wrapped: the wrapper turns checks
+// back on, and sigreturn restores the interrupted state afterwards.
+static _Atomic(uintptr_t) user_handler[NSIG];
+static _Atomic int user_siginfo[NSIG];
+
+static void signal_entry(int sig, siginfo_t *si, void *uc) {
+    tw_tco_force(0);
+    uintptr_t h = atomic_load(&user_handler[sig]);
+    if (atomic_load(&user_siginfo[sig])) ((void (*)(int, siginfo_t *, void *))h)(sig, si, uc);
+    else ((void (*)(int))h)(sig);
+}
+
+static int is_real_handler(const struct sigaction *sa) {
+    return sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_ERR;
+}
+
+static int tw_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    if (!tw_on() || sig <= 0 || sig >= NSIG) return sigaction(sig, act, oact);
+    uintptr_t prev_handler = atomic_load(&user_handler[sig]);
+    int prev_siginfo = atomic_load(&user_siginfo[sig]);
+    struct sigaction mine, old;
+    const struct sigaction *use = act;
+    if (act && is_real_handler(act)) {
+        mine = *act;
+        atomic_store(&user_siginfo[sig], (act->sa_flags & SA_SIGINFO) != 0);
+        atomic_store(&user_handler[sig], (uintptr_t)act->sa_sigaction);
+        mine.sa_sigaction = signal_entry;
+        mine.sa_flags |= SA_SIGINFO;
+        use = &mine;
+    }
+    int rc = sigaction(sig, use, &old);
+    if (rc != 0) {
+        if (use == &mine) {
+            atomic_store(&user_handler[sig], prev_handler);
+            atomic_store(&user_siginfo[sig], prev_siginfo);
+        }
+        return rc;
+    }
+    if (oact) {
+        *oact = old;
+        if (old.sa_sigaction == signal_entry) { // report the program's own handler, not the wrapper
+            oact->sa_sigaction = (void (*)(int, siginfo_t *, void *))prev_handler;
+            if (!prev_siginfo) oact->sa_flags &= ~SA_SIGINFO;
+        }
+    }
+    return 0;
+}
+
+static sig_t tw_signal(int sig, sig_t handler) {
+    if (!tw_on()) return signal(sig, handler);
+    struct sigaction sa, old;
+    sa.sa_handler = handler;
+    sa.sa_flags = SA_RESTART; // BSD signal() semantics
+    sigemptyset(&sa.sa_mask);
+    if (tw_sigaction(sig, &sa, &old) != 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
+INTERPOSE(tw_sigaction, sigaction);
+INTERPOSE(tw_signal, signal);

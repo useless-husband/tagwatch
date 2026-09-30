@@ -40,13 +40,14 @@ int main(void) {
     // One read elsewhere, one C++ frame, one use-after-free, one kernel access.
     feed(r, "{\"ev\":\"access\",\"seq\":4,\"t_ns\":11,\"kind\":\"read\",\"size\":4,\"addr\":\"0x2000\",\"watch\":2,\"off\":0,\"tid\":100,"
             "\"bt\":[{\"pc\":\"0x40\",\"sym\":\"_ZN4Tree6insertEi\",\"off\":12,\"img\":\"demo\"}]}");
-    feed(r, "{\"ev\":\"unwatch\",\"id\":1,\"t_ns\":12,\"reason\":\"quarantine-evict\",\"reads\":0,\"writes\":3}");
+    feed(r, "{\"ev\":\"free\",\"id\":1,\"t_ns\":12}");
     feed(r, "{\"ev\":\"access\",\"seq\":5,\"t_ns\":13,\"kind\":\"rw\",\"size\":8,\"addr\":\"0x1000\",\"watch\":1,\"off\":0,\"tid\":100,"
             "\"freed\":true,\"bt\":[{\"pc\":\"0x50\",\"img\":\"demo\",\"imgoff\":80}]}");
     feed(r, "{\"ev\":\"access\",\"seq\":1099511627777,\"t_ns\":14,\"kind\":\"write\",\"size\":5,\"addr\":\"0x2000\",\"watch\":2,\"off\":0,"
             "\"tid\":100,\"syscall\":\"read\",\"bt\":[{\"pc\":\"0x60\",\"sym\":\"main\",\"off\":300,\"img\":\"demo\"}]}");
     feed(r, "{\"ev\":\"violation\",\"t_ns\":15,\"kind\":\"write\",\"size\":1,\"addr\":\"0x9999\",\"tid\":100,"
             "\"bt\":[{\"pc\":\"0x70\",\"sym\":\"overflow\",\"off\":4,\"img\":\"demo\"}]}");
+    feed(r, "{\"ev\":\"unwatch\",\"id\":1,\"t_ns\":15,\"reason\":\"quarantine-evict\",\"reads\":0,\"writes\":3}");
     feed(r, "{\"ev\":\"note\",\"t_ns\":16,\"kind\":\"fork\",\"msg\":\"forked child runs without watches\"}");
     feed(r, "{\"ev\":\"stats\",\"t_ns\":17,\"events\":6,\"traps\":7,\"filtered\":1,\"far_traps\":2,\"emulated\":0,\"syscalls\":1,"
             "\"violations\":1,\"watches_total\":2,\"watches_live\":1,\"trampolines\":4}");
@@ -55,7 +56,8 @@ int main(void) {
 
     tw_report_totals t;
     tw_report_get_totals(r, &t);
-    CHECK_EQ(t.lines, 15);
+    CHECK_EQ(t.lines, 16);
+    CHECK_EQ(t.watches_freed, 1);
     CHECK_EQ(t.bad_lines, 2);
     CHECK_EQ(t.accesses, 6);
     CHECK_EQ(t.reads, 1);
@@ -73,9 +75,9 @@ int main(void) {
     const char *out = render(r);
     CHECK(strstr(out, "program    /tmp/demo (pid 77)"));
     CHECK(strstr(out, "6 reported: 1 read, 4 write, 1 read-modify-write"));
-    CHECK(strstr(out, "2 armed, 1 still armed at exit"));
+    CHECK(strstr(out, "2 armed, 1 still armed at exit (1 objects were freed by the program)"));
     CHECK(strstr(out, "allocated by make_node+0x20 (demo)"));
-    CHECK(strstr(out, "0 reads, 3 writes, 1 read-modify-writes, 1 AFTER FREE; ended: quarantine-evict"));
+    CHECK(strstr(out, "0 reads, 3 writes, 1 read-modify-writes, 1 AFTER FREE; freed"));
     // The busiest site comes first and merges both offsets and both threads.
     const char *site = strstr(out, "Access sites");
     CHECK(site != NULL);

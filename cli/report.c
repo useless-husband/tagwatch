@@ -16,7 +16,7 @@ typedef struct {
     uint64_t base, len;
     char *label, *origin, *site; // site: where it was allocated
     uint64_t reads, writes, rw, after_free, by_kernel;
-    int seen, live;
+    int seen, live, freed;
     char *end_reason;
     uint32_t *heat_r, *heat_w;
     uint32_t heat_rows;
@@ -282,6 +282,12 @@ int tw_report_feed(tw_report *r, char *line) {
             w->end_reason = strdup(json_str(o, "reason", ""));
             r->tot.watches_live--;
         }
+    } else if (!strcmp(ev, "free")) {
+        watch_t *w = watch_slot(r, json_int(o, "id", 0));
+        if (w && w->seen && !w->freed) {
+            w->freed = 1;
+            r->tot.watches_freed++;
+        }
     } else if (!strcmp(ev, "violation")) {
         if (r->tot.violations < 16) {
             violation_t *v = &r->violations[r->tot.violations];
@@ -362,8 +368,9 @@ static void print_heat(const tw_report *r, const watch_t *w, FILE *out) {
         uint64_t v = (uint64_t)w->heat_r[i] + w->heat_w[i];
         if (v > max) max = v;
     }
-    fprintf(out, "\nHeat map of watch #%lld \"%s\" (%llu bytes, %llu bytes per row)\n", (long long)w->id, w->label,
-            (unsigned long long)w->len, (unsigned long long)row_bytes);
+    fprintf(out, "\nHeat map of watch #%lld", (long long)w->id);
+    if (w->label[0]) fprintf(out, " \"%s\"", w->label);
+    fprintf(out, " (%llu bytes, %llu bytes per row)\n", (unsigned long long)w->len, (unsigned long long)row_bytes);
     fprintf(out, "    offset       reads    writes\n");
     uint32_t skipped = 0;
     for (uint32_t i = 0; i < w->heat_rows; i++) {
@@ -388,8 +395,10 @@ void tw_report_print(const tw_report *r, FILE *out) {
             (unsigned long long)t->reads, (unsigned long long)t->writes, (unsigned long long)t->rw);
     if (t->by_kernel) fprintf(out, "           %llu made by the kernel in system calls\n", (unsigned long long)t->by_kernel);
     if (t->after_free) fprintf(out, "           %llu to objects that had already been freed\n", (unsigned long long)t->after_free);
-    fprintf(out, "watches    %llu armed, %llu still armed at exit\n", (unsigned long long)t->watches,
+    fprintf(out, "watches    %llu armed, %llu still armed at exit", (unsigned long long)t->watches,
             (unsigned long long)t->watches_live);
+    if (t->watches_freed) fprintf(out, " (%llu objects were freed by the program)", (unsigned long long)t->watches_freed);
+    fputc('\n', out);
     fprintf(out, "threads    %d\n", r->n_tids);
     if (r->have_stats)
         fprintf(out, "traps      %lld taken (%lld not reported: filtered or granule neighbours; %lld via the slow return path; "
@@ -418,7 +427,8 @@ void tw_report_print(const tw_report *r, FILE *out) {
             if (w->rw) fprintf(out, ", %llu read-modify-writes", (unsigned long long)w->rw);
             if (w->by_kernel) fprintf(out, ", %llu by the kernel", (unsigned long long)w->by_kernel);
             if (w->after_free) fprintf(out, ", %llu AFTER FREE", (unsigned long long)w->after_free);
-            if (!w->live && w->end_reason) fprintf(out, "; ended: %s", w->end_reason);
+            if (w->freed) fprintf(out, "; freed");
+            else if (!w->live && w->end_reason) fprintf(out, "; ended: %s", w->end_reason);
             fputc('\n', out);
         }
         if (nw > shown) {

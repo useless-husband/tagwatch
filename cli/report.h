@@ -32,7 +32,7 @@ typedef struct {
     uint64_t lines, bad_lines;
     uint64_t accesses, reads, writes, rw;
     uint64_t after_free, by_kernel, violations;
-    uint64_t watches, watches_live, sites, threads;
+    uint64_t watches, watches_live, watches_freed, sites, threads;
     int started; // a "start" record was seen: the runtime was loaded
 } tw_report_totals;
 void tw_report_get_totals(const tw_report *r, tw_report_totals *t);

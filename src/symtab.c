@@ -1,6 +1,8 @@
 #include "symtab.h"
 
 #include <mach-o/dyld.h>
+#include <mach-o/dyld_images.h>
+#include <mach/mach.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <os/lock.h>
@@ -48,7 +50,7 @@ static const char *basename_of(const char *path) {
 static void index_image(const struct mach_header_64 *mh, intptr_t slide, image_t *im) {
     memset(im, 0, sizeof *im);
     im->mh = mh;
-    im->slide = (uint64_t)slide;
+    (void)slide; // derived below: the Mach-O header is the first byte of __TEXT
     im->is_main = mh->filetype == MH_EXECUTE;
     im->path = im->is_main ? main_path : "(unnamed image)";
     const struct load_command *lc = (const struct load_command *)(mh + 1);
@@ -59,6 +61,7 @@ static void index_image(const struct mach_header_64 *mh, intptr_t slide, image_t
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
             if (!strcmp(sg->segname, SEG_TEXT)) {
+                im->slide = (uint64_t)(uintptr_t)mh - sg->vmaddr;
                 im->text_lo = sg->vmaddr + im->slide;
                 im->text_hi = im->text_lo + sg->vmsize;
                 const struct section_64 *sec = (const struct section_64 *)(sg + 1);
@@ -121,6 +124,23 @@ void tw_symtab_init(void) {
     if (was) return;
     uint32_t n = sizeof main_path;
     if (_NSGetExecutablePath(main_path, &n) != 0) strcpy(main_path, "(main executable)");
+    // dyld itself (which holds `start`, the outermost frame of the main
+    // thread) is not announced through the image callbacks.
+    struct task_dyld_info di;
+    mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &cnt) == KERN_SUCCESS && di.all_image_info_addr) {
+        const struct dyld_all_image_infos *all = (const struct dyld_all_image_infos *)(uintptr_t)di.all_image_info_addr;
+        const struct mach_header *dyld = all->dyldImageLoadAddress;
+        if (dyld && dyld->magic == MH_MAGIC_64) {
+            image_t im;
+            index_image((const struct mach_header_64 *)(const void *)dyld, 0, &im);
+            im.path = "/usr/lib/dyld";
+            im.base = "dyld";
+            os_unfair_lock_lock(&lock);
+            if (n_images < MAX_IMAGES) images[n_images++] = im;
+            os_unfair_lock_unlock(&lock);
+        }
+    }
     // dyld calls on_add for every image already loaded, then for new ones.
     _dyld_register_func_for_add_image(on_add);
     _dyld_register_func_for_remove_image(on_remove);

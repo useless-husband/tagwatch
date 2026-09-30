@@ -108,6 +108,7 @@ void tw_out_after_fork(void);
 void tw_emit_start(const char *engine);
 void tw_emit_watch(const tw_watch *w, const uint64_t *bt, unsigned nbt);
 void tw_emit_unwatch(uint64_t serial, const char *reason, uint64_t reads, uint64_t writes);
+void tw_emit_freed(uint64_t serial);
 void tw_emit_access(const tagwatch_event *ev);
 void tw_emit_violation(uint64_t addr, uint64_t pc, uint64_t tid, unsigned access, unsigned size, const uint64_t *frames,
                        unsigned nframes);

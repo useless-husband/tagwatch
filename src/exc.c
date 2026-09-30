@@ -268,9 +268,10 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
     if (rq->code[0] != EXC_CODE_MTE_TAGCHECK) return KERN_FAILURE;
 
     if (tw_tramp_owner(pc, &entry, &orig_pc, &word)) {
-        // A fault inside a slot means TCO was cleared under us, which happens
-        // when a signal handler ran in between and sigreturn restored the
-        // register state without it. Start the slot again.
+        // A fault inside a slot means the thread lost PSTATE.TCO between the
+        // slot's first instruction and the access. That can only happen if a
+        // signal handler ran in between and the state it returned to no
+        // longer had the bit. Start the slot again.
         ns->__pc = entry;
         return KERN_SUCCESS;
     }

@@ -293,7 +293,8 @@ void *tw_alloc_watched(size_t size, size_t align, int spec_idx, const void *fram
     if (!p) return NULL;
     uint64_t bt[TW_ALLOC_BT];
     unsigned n = tw_backtrace_fp(frame, bt, TW_ALLOC_BT);
-    tw_watch_add((uint64_t)(uintptr_t)p, size ? size : 1, s->label, s->mode, TW_ORIGIN_ALLOC, bt, n);
+    const char *label = s->label[0] ? s->label : s->caller; // may be empty
+    tw_watch_add((uint64_t)(uintptr_t)p, size ? size : 1, label, s->mode, TW_ORIGIN_ALLOC, bt, n);
     return p;
 }
 

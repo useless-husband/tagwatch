@@ -66,7 +66,7 @@ MTE_TESTS := $(patsubst tests/mte/%.c,%,$(wildcard tests/mte/t_*.c))
 # Library-mode tests link the dylib and carry the hardened-process
 # entitlements, which is what enables MTE for a binary started directly.
 $(B)/mte/t_%: tests/mte/t_%.c tests/mte/mt.h $(B)/libtagwatch.dylib $(ENT) | $(B)/mte
-	$(CC) $(OPT) -std=c11 $(ARCH) -Wall -Wextra -Werror -Iinclude -o $@ $< -L$(B) -ltagwatch -Wl,-rpath,@executable_path/..
+	$(CC) $(OPT) -std=c11 $(ARCH) -Wall -Wextra -Werror -Iinclude -o $@ $< -L$(B) -ltagwatch -lz -Wl,-rpath,@executable_path/..
 	codesign -s - --entitlements $(ENT) -f $@ 2>/dev/null
 
 # Plain, unsigned-for-MTE targets for `tagwatch run`.

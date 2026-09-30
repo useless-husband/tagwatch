@@ -254,6 +254,19 @@ void tw_emit_unwatch(uint64_t serial, const char *reason, uint64_t reads, uint64
     }
 }
 
+void tw_emit_freed(uint64_t serial) {
+    if (trace_fd < 0) return;
+    char s[128];
+    tw_buf b;
+    tw_buf_init(&b, s, sizeof s);
+    tw_put_str(&b, "{\"ev\":\"free\",\"id\":");
+    tw_put_dec(&b, serial);
+    tw_put_str(&b, ",\"t_ns\":");
+    tw_put_dec(&b, tw_now_ns());
+    tw_put_str(&b, "}\n");
+    flush(trace_fd, &b);
+}
+
 void tw_emit_access(const tagwatch_event *ev) {
     char s[8192];
     tw_buf b;
@@ -304,7 +317,7 @@ void tw_emit_access(const tagwatch_event *ev) {
             tw_put_str(&b, ev->label);
             tw_put_char(&b, '"');
         }
-        tw_put_str(&b, ev->offset < 0 ? "" : "+");
+        tw_put_str(&b, ev->offset < 0 ? " " : " +");
         tw_put_sdec(&b, ev->offset);
         tw_put_str(&b, "  thread ");
         tw_put_dec(&b, ev->thread_id);

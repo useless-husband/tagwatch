@@ -165,8 +165,13 @@ int tw_watch_remove_addr(uint64_t addr, const char *reason) {
 int tw_watch_mark_freed(uint64_t addr) {
     os_unfair_lock_lock(&lock);
     uint32_t slot = tw_wtab_get(&table, addr & TW_ADDR_MASK, NULL);
-    if (slot) slot_ptr(slot)->flags |= TW_WF_FREED;
+    uint64_t serial = 0;
+    if (slot) {
+        slot_ptr(slot)->flags |= TW_WF_FREED;
+        serial = slot_ptr(slot)->serial;
+    }
     os_unfair_lock_unlock(&lock);
+    if (slot) tw_emit_freed(serial);
     return slot != 0;
 }
 
