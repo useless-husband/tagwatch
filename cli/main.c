@@ -67,6 +67,7 @@ static void usage(FILE *out) {
             "      --quarantine BYTES     freed watched objects kept armed to catch use-after-free (default 1m, 0 = off)\n"
             "      --no-aslr              load the program at fixed addresses\n"
             "      --lib PATH             location of libtagwatch.dylib\n"
+            "      --no-runtime           only enable MTE for the program; insert nothing, watch nothing (for measurements)\n"
             "  -v, --verbose              also log watches as they are armed and removed\n");
 }
 
@@ -114,6 +115,7 @@ static int find_program(const char *name, char *out) {
 }
 
 // Launches argv with MTE enabled and the runtime inserted; returns the pid.
+// lib == NULL starts the program with MTE on but without the runtime.
 static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr, char *const extra_env[], int n_extra) {
     shim_fn set_shims = (shim_fn)dlsym(RTLD_DEFAULT, SHIM_SPI);
     if (!set_shims) {
@@ -143,16 +145,16 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     size_t k = 0;
     char *insert = NULL;
     for (size_t i = 0; i < n_env; i++) {
-        if (!strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22)) {
+        if (lib && !strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22)) {
             if (asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s:%s", lib, environ[i] + 22) < 0) return -1;
             continue;
         }
         if (!strncmp(environ[i], "TAGWATCH_", 9)) continue; // only what this invocation asks for
         env[k++] = environ[i];
     }
-    if (!insert && asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s", lib) < 0) return -1;
-    env[k++] = insert;
-    for (int i = 0; i < n_extra; i++) env[k++] = extra_env[i];
+    if (lib && !insert && asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s", lib) < 0) return -1;
+    if (insert) env[k++] = insert;
+    for (int i = 0; lib && i < n_extra; i++) env[k++] = extra_env[i];
     env[k] = NULL;
 
     pid_t pid = -1;
@@ -203,7 +205,7 @@ static int cmd_run(int argc, char **argv) {
     char raw[16][600];
     int n_raw = 0;
     const char *trace = NULL, *log = NULL, *lib_override = NULL;
-    int quiet = 0, no_summary = 0, writes_only = 0, no_aslr = 0, verbose = 0;
+    int quiet = 0, no_summary = 0, writes_only = 0, no_aslr = 0, verbose = 0, no_runtime = 0;
     int64_t depth = -1, max_events = -1, quarantine = -1;
     tw_report_opts ropts;
     tw_report_default_opts(&ropts);
@@ -278,6 +280,7 @@ static int cmd_run(int argc, char **argv) {
             NEED_VAL();
             quarantine = need_number(a, val);
         } else if (!strcmp(a, "--no-aslr")) no_aslr = 1;
+        else if (!strcmp(a, "--no-runtime")) no_runtime = 1;
         else if (!strcmp(a, "--lib")) {
             NEED_VAL();
             lib_override = val;
@@ -296,7 +299,7 @@ static int cmd_run(int argc, char **argv) {
     }
     static char specs[8192];
     for (int k = 0; k < n_raw; k++) add_spec(specs, sizeof specs, raw[k], writes_only);
-    if (n_raw == 0)
+    if (n_raw == 0 && !no_runtime)
         fprintf(stderr, "tagwatch: no --watch-* option given; the program will run with MTE enabled and only watches\n"
                         "tagwatch: it sets itself through the tagwatch API will be reported\n");
 
@@ -371,13 +374,17 @@ static int cmd_run(int argc, char **argv) {
         extra[ne++] = env_pair("TAGWATCH_QUARANTINE", num);
     }
 
-    pid_t pid = launch(prog, argv + i, lib, no_aslr, extra, ne);
+    pid_t pid = launch(prog, argv + i, no_runtime ? NULL : lib, no_aslr, extra, ne);
     if (pid < 0) {
         if (temp) unlink(tmp_trace);
         return 2;
     }
     int termsig = 0;
     int status = tw_supervise(pid, &termsig);
+    if (no_runtime) { // nothing was traced: there is no summary to print
+        if (temp) unlink(tmp_trace);
+        return status;
+    }
     if (log_fd >= 0) close(log_fd);
 
     tw_report *rep = tw_report_new(&ropts);

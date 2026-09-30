@@ -21,7 +21,7 @@ CLI     := main report json
 UNIT    := fmt insn wtab spec symtab json report
 
 .SECONDARY:
-.PHONY: all unit mte-test test lint asan bench examples clean
+.PHONY: all unit mte-test test lint asan bench bench-build examples clean
 all: $(B)/libtagwatch.dylib $(B)/tagwatch examples
 
 $(B)/obj $(B)/cli $(B)/unit $(B)/mte $(B)/examples $(B)/bench:
@@ -90,6 +90,24 @@ mte-test: all $(MTE_TESTS:%=$(B)/mte/%) $(MTE_TARGETS)
 	@sh tests/run_mte.sh $(B) $(MTE_TESTS)
 
 test: unit mte-test
+
+# ---- benchmarks -------------------------------------------------------------------
+BENCH_PLAIN := kv pagewatch hwwatch
+$(B)/bench/%: bench/%.c $(wildcard bench/*.h) | $(B)/bench
+	$(CC) -O2 -g $(ARCH) -Wall -Wextra -o $@ $<
+
+# These two need MTE: trapcost uses the library, naive_step tags memory itself.
+$(B)/bench/trapcost: bench/trapcost.c $(B)/libtagwatch.dylib $(ENT) | $(B)/bench
+	$(CC) -O2 -g $(ARCH) -Wall -Wextra -Iinclude -o $@ $< -L$(B) -ltagwatch -Wl,-rpath,@executable_path/..
+	codesign -s - --entitlements $(ENT) -f $@ 2>/dev/null
+$(B)/bench/naive_step: bench/naive_step.c bench/excport.h $(ENT) | $(B)/bench
+	$(CC) -O2 -g $(ARCH) -march=armv8.5-a+memtag -Wall -Wextra -o $@ $<
+	codesign -s - --entitlements $(ENT) -f $@ 2>/dev/null
+
+bench-build: all $(BENCH_PLAIN:%=$(B)/bench/%) $(B)/bench/trapcost $(B)/bench/naive_step
+
+bench: bench-build
+	@sh bench/run.sh $(B)
 
 # ---- quality gates ---------------------------------------------------------------
 lint:
