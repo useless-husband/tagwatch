@@ -3,16 +3,25 @@ CC      ?= clang
 ARCH    := -arch arm64
 WARN    := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wconversion -Wno-sign-conversion -Werror
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=c11 $(ARCH) $(WARN) -Iinclude
+CFLAGS  += -std=c11 $(ARCH) $(WARN) -Iinclude -fvisibility=hidden
 B       := build
 
 # Logic that does not need MTE. Unit-tested on any arm64 Mac (and in CI).
 PURE    := fmt insn wtab spec symtab
 UNIT    := $(PURE)
 
+RUNTIME := $(PURE) vm watch bt trace tramp exc arena interpose adopt supervise runtime mte
+
 .SECONDARY:
 .PHONY: all unit test clean
-all: unit
+all: $(B)/libtagwatch.dylib
+
+# MTE instructions live in one file; the rest builds for any arm64 CPU.
+$(B)/obj/mte.o: src/mte.c $(wildcard src/*.h) include/tagwatch.h | $(B)/obj
+	$(CC) $(CFLAGS) -march=armv8.5-a+memtag -c -o $@ $<
+
+$(B)/libtagwatch.dylib: $(RUNTIME:%=$(B)/obj/%.o)
+	$(CC) $(ARCH) -dynamiclib -install_name @rpath/libtagwatch.dylib -o $@ $^
 
 $(B)/obj/%.o: src/%.c $(wildcard src/*.h) include/tagwatch.h | $(B)/obj
 	$(CC) $(CFLAGS) -c -o $@ $<

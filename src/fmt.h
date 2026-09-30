@@ -7,6 +7,7 @@
 #ifndef TW_FMT_H
 #define TW_FMT_H
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,6 +28,7 @@ void tw_put_hex(tw_buf *b, uint64_t v); // "0x1f"
 void tw_put_json_str(tw_buf *b, const char *s); // quoted and escaped
 // printf subset: %s %d %u %x %p %c %% with optional l/ll/z length modifiers.
 void tw_put_fmt(tw_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void tw_put_vfmt(tw_buf *b, const char *fmt, va_list ap);
 
 // Parsing helpers shared by the spec parser and the CLI.
 // Accepts decimal, 0x-hex, and the suffixes k/K, m/M (powers of 1024).

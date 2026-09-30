@@ -90,6 +90,11 @@ void tw_put_json_str(tw_buf *b, const char *s) {
 void tw_put_fmt(tw_buf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+    tw_put_vfmt(b, fmt, ap);
+    va_end(ap);
+}
+
+void tw_put_vfmt(tw_buf *b, const char *fmt, va_list ap) {
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
             tw_put_char(b, *fmt);
@@ -118,13 +123,12 @@ void tw_put_fmt(tw_buf *b, const char *fmt, ...) {
             break;
         case 'p': tw_put_hex(b, (uint64_t)(uintptr_t)va_arg(ap, void *)); break;
         case '%': tw_put_char(b, '%'); break;
-        case 0: va_end(ap); return;
+        case 0: return;
         default:
             tw_put_char(b, '%');
             tw_put_char(b, *fmt);
         }
     }
-    va_end(ap);
 }
 
 int tw_parse_u64(const char *s, size_t n, uint64_t *out) {
