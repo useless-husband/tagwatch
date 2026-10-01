@@ -80,8 +80,8 @@ are filtered out by address.
 | Private interface | `tagwatch run` enables MTE in the child with `posix_spawnattr_set_use_sec_transition_shims_np`, a private SPI in libsystem (the same call LLDB's `process launch --memory-tagging` makes). Apple can change or remove it. |
 | Debugger-style recovery | On macOS a tag-check fault kills the process unless it is being traced. The target therefore calls `ptrace(PT_TRACE_ME)` and tagwatch acts as its tracing parent. A process has one tracer, so LLDB cannot attach to it as well, and it stops briefly on every signal (see Limitations). |
 | Granularity | MTE tags cover 16-byte granules. tagwatch reports byte-precisely (it filters by address), but every access to a granule that contains a watched byte pays for a trap. |
-| Cost | About **5 µs per trapped access** on the M5 (7–8 µs with full logging), against 0.1 ns untrapped. Watching hot memory is slow; see Measurements. |
-| Cannot be traced | Binaries with the hardened runtime and system binaries protected by SIP (they ignore `DYLD_INSERT_LIBRARIES`; tagwatch says so and the program runs unwatched), arm64e binaries (the runtime is built for arm64; untested), and processes that are already running (there is no attach). |
+| Cost | About **5 µs per trapped access** on the M5 (8–9 µs with the JSON trace and live log), against 0.1 ns untrapped. Watching hot memory is slow; see Measurements. |
+| Cannot be traced | Binaries with the hardened runtime and system binaries protected by SIP: they ignore `DYLD_INSERT_LIBRARIES`, so they run unwatched and tagwatch says so. Programs with no arm64 code (arm64e-only, x86_64): the runtime is arm64 only, so `tagwatch run` refuses them with that reason (a universal arm64 + arm64e binary is run as arm64). Processes that are already running: there is no attach. Each case is tested in `cli.sh`. |
 
 `tagwatch check` tests all of this on your machine, including an end-to-end watch:
 
@@ -237,9 +237,10 @@ Why this shape, and what was tried and rejected, is in [docs/DESIGN.md](docs/DES
 ### What is guaranteed with several threads
 
 Because a watched granule keeps its watch tag while one thread is being let through, other threads touching it at
-the same moment still fault. Every tag-checked access by any thread is trapped exactly once and takes effect exactly
-once. `t_threads` checks this with exact counts (8 threads, 36 000 accesses, all reported, all values correct), and
-`t_signal` checks it with a timer signal landing on a thread that is handling traps.
+the same moment still fault. Every tag-checked access by any thread is reported exactly once and takes effect exactly
+once. `t_threads` checks this with exact counts (8 threads, 36 000 accesses, all reported, all values correct; and
+80 000 accesses, all reported, while another thread keeps trying to arm untaggable memory), and `t_signal` checks it with a timer signal landing
+on a thread that is handling traps.
 
 Not covered, by the nature of MTE or of the mechanism:
 
@@ -257,9 +258,10 @@ Each row is covered by a test that runs on MTE hardware (`make test`).
 | --- | --- | --- |
 | Several threads on one granule | All accesses trapped, exact counts. | `t_threads`, `t_far` |
 | Arm/disarm while threads access | Faults already in flight when a watch is removed are retried, not reported as errors. | `t_threads` |
+| Arming memory that cannot be tagged (or is unmapped) while other threads trap | `TAGWATCH_ENOTTAGGED`, and the other threads' accesses are all still reported. (This used to deadlock; see DESIGN.md section 5.) | `t_threads` |
 | `read`/`write`/`pread`/`pwrite`/`recv`/`send`/`fread`/`fwrite` on a watched buffer | A kernel access to an armed granule is fatal (next row), so the call is run against a bounce buffer, the data copied with tag checks off, and the access reported as made "by the kernel" with the caller's backtrace. | `t_syscall` |
 | Any other system call on a watched buffer (`readv`, `getcwd`, `ioctl`, …) | **Not handled:** the kernel takes a fatal tag fault and the process is killed (exit status 137). | `cli.sh` ("unshimmed system call") |
-| Large allocations (the system allocator only tags blocks up to about 4 KB) | Matching allocations are served from tagwatch's own MTE-backed arena, any size. | `t_alloc` (up to 70 MB) |
+| Large allocations (the system allocator only tags blocks up to 32 KB) | Matching allocations are served from tagwatch's own MTE-backed arena, any size. | `t_alloc` (up to 70 MB) |
 | Globals | The pages are replaced in place by MTE-backed copies ("adoption"), with other threads suspended. Done automatically for `-s`. | `t_adopt`, `cli.sh` |
 | Stack memory | Another thread's stack can be adopted and watched; only accesses through pointers are seen. A thread cannot adopt its own stack. | `t_adopt` |
 | Code and read-only file-backed pages | Cannot be adopted; `tagwatch_watch` returns `TAGWATCH_ENOTTAGGED`. | `t_adopt`, `t_basic` |
@@ -271,24 +273,27 @@ Each row is covered by a test that runs on MTE hardware (`make test`).
 | Code in system libraries (`memcpy`, `strlen`, zlib, …) | Traced like any other code; backtraces go through leaf functions correctly. | `t_insn` |
 | Code more than 128 MB from any free address space (deep in the dyld shared cache) | The slot cannot branch back, so it ends in a breakpoint: two exceptions per access instead of one. | `t_far`, `t_insn` (zlib) |
 | `LDXR`/`STXR` loops | Cannot be re-executed (the fault clears the exclusive monitor), so the pair is emulated as a compare-and-swap. | `t_insn` |
+| Every load/store form: pre/post-index writeback, pairs (including a pair load that overwrites its base), SIMD structure loads, LSE atomics, `CASP`, RCpc loads, `DC ZVA` | Reported with the exact address, width and direction; the effect, writeback and atomic results are checked. | `t_insn`, decoder vectors in `test_insn` |
+| An instruction the decoder does not know (SME loads and stores in streaming mode) | Let through like any other; reported as 1 byte at the fault address, direction from the fault syndrome. | `t_insn` |
 | A genuine MTE violation in the program (the target now runs with MTE on) | Reported with a backtrace as "not a watchpoint"; the program then dies as it would have. | `cli.sh` |
 
 ## Measurements
 
-Apple M5 (10 cores, 16 GB), macOS 27.0, Apple clang 17, 1 October 2026. The machine was shared with other jobs (load
-average 3–7 during the run), so treat the figures as ±15%. Each is the median of 5 runs. Reproduce with `make bench`;
-method and raw output are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Apple M5 (10 cores, 16 GB), macOS 27.0, Apple clang 17, 1 October 2026, with the code as committed. The machine was
+shared with other jobs (load average about 3 at the start of the run), so treat the figures as ±15% or worse. Each is
+the median of 5 runs. Reproduce with `make bench`; method and raw output are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **Per trapped access**
 
 | Mechanism | µs per access |
 | --- | --- |
 | tagwatch, event delivered to a callback, nothing written | 4.7 |
-| tagwatch, JSON record with a 16-frame symbolised backtrace written to a file | 6.6 |
-| tagwatch, JSON record and live log line | 7.6 |
-| tagwatch, slow return path (code far from free address space, 2 exceptions) | 8.9 |
-| retag + single-step + retag (the obvious design; rejected, also racy) | 15.5 |
-| `mprotect` page watch (fault, single-step, two `mprotect` calls) | 16.3 |
+| tagwatch, JSON record with a symbolised backtrace written to a file | 7.8 |
+| tagwatch, JSON record and live log line | 8.5 |
+| tagwatch, slow return path (code far from free address space, 2 exceptions) | 9.5 |
+| retag + single-step + retag (the obvious design; rejected, also racy) | 14.8 |
+| `mprotect` page watch (fault, single-step, two `mprotect` calls) | 16.5 |
 | an untrapped access, for scale | 0.0001 |
 
 **Overhead on a workload.** `bench/kv.c`: a hash table of 100 000 heap nodes (48 bytes each), one million lookups and
@@ -296,18 +301,20 @@ updates on random keys; time for the operations phase.
 
 | Configuration | Time (ms) | Traps | Slowdown |
 | --- | --- | --- | --- |
-| native, MTE off | 10.0 | – | 1.0× |
-| MTE on, tagwatch not loaded (`--no-runtime`) | 10.0 | – | 1.0× |
-| tagwatch loaded, nothing matched | 9.9 | 0 | 1.0× |
-| 1 node watched | 10.7 | 23 | 1.1× |
-| 10 nodes watched (1 in 10 000) | 14.2 | 428 | 1.4× |
-| 100 nodes (1 in 1 000) | 41.3 | 4 068 | 4.1× |
-| 1 000 nodes (1 in 100) | 309 | 40 116 | 31× |
-| 10 000 nodes (1 in 10) | 2 954 | 405 522 | 295× |
-| all 100 000 nodes | 28 156 | 4 049 194 | 2 800× |
+| native, MTE off | 11.3 | – | baseline |
+| MTE on, tagwatch not loaded (`--no-runtime`) | 9.8 | – | baseline |
+| tagwatch loaded, nothing matched | 9.9 | 0 | baseline |
+| 1 node watched | 10.2 | 23 | 1.0× |
+| 10 nodes watched (1 in 10 000) | 14.0 | 428 | 1.4× |
+| 100 nodes (1 in 1 000) | 39.8 | 4 068 | 3.9× |
+| 1 000 nodes (1 in 100) | 295 | 40 116 | 29× |
+| 10 000 nodes (1 in 10) | 2 653 | 405 522 | 257× |
+| all 100 000 nodes | 25 866 | 4 049 194 | 2 500× |
 
-Cost is proportional to the number of trapped accesses, about 7 µs each here, and nothing else: a few objects in a
-large program cost nothing measurable, every object in a hot loop costs three orders of magnitude. (The operations
+The first three rows agree within the noise of the shared machine (the native run happened to be the slowest), so the
+slowdown is taken against their mean, 10.3 ms. Cost is proportional to the number of trapped accesses, about 6.4 µs
+each here, and nothing else: a few objects in a large program cost nothing measurable, every object in a hot loop
+costs three orders of magnitude. (The operations
 phase does not allocate, so this table does not measure the allocation interposers, which add a branch per
 `malloc` when no allocation spec is active.)
 
@@ -316,19 +323,19 @@ protecting their pages. Both tools report the same number of true accesses, whic
 
 | Watched | Tool | Time (ms) | Traps | Accesses to watched nodes | False traps |
 | --- | --- | --- | --- | --- | --- |
-| 1 node | tagwatch | 9.8 | 23 | 20 (+3 during table construction) | 0 |
-| 1 node | mprotect | 32.0 | 1 300 | 20 | 98.5% |
-| 100 nodes | tagwatch | 43.0 | 4 068 | 3 768 (+300 during construction) | 0 |
-| 100 nodes | mprotect | 20 383 | 1 267 454 | 3 768 | 99.7% |
+| 1 node | tagwatch | 10.2 | 23 | 20 (+3 during table construction) | 0 |
+| 1 node | mprotect | 31.4 | 1 200 | 20 | 98.3% |
+| 100 nodes | tagwatch | 42.3 | 4 068 | 3 768 (+300 during construction) | 0 |
+| 100 nodes | mprotect | 20 512 | 1 267 312 | 3 768 | 99.7% |
 
 A 16 KB page holds about 340 of these nodes, so a page watch takes roughly 340 traps for each one that matters. With
-100 watched nodes spread over 100 pages it is 470 times slower than tagwatch on this workload.
+100 watched nodes spread over 100 pages it is 480 times slower than tagwatch on this workload.
 
 **Hardware watchpoints.** `sysctl hw.optional.watchpoint` reports **4** debug registers on the M5; that is the limit
 LLDB watchpoints live under, against 100 000 simultaneous watches in the table above. I could not time LLDB itself:
 Developer Mode is off on the development machine and I have no administrator rights there, so LLDB cannot launch a
 process. As a substitute `bench/hwwatch.c` programs the same debug registers from inside the process; a delivered hit
-cost 17–33 µs, but only a fraction of the hits were delivered in that configuration (36 of 5 000 in the recorded run),
+cost 17–25 µs, but only a fraction of the hits were delivered in that configuration (11 of 5 000 in the recorded run),
 so it is not a usable baseline and I draw no conclusion from it beyond the register count.
 
 ## Limitations
@@ -340,7 +347,7 @@ so it is not a usable baseline and I draw no conclusion from it beyond the regis
   `wait`, `read` and `write` families in that case; other calls (`select`, `poll`, `nanosleep`, `accept`, …) are
   not covered and a program that does not handle `EINTR` there can misbehave.
 - **Unwrapped system calls on watched memory kill the process** (see the table above).
-- **No attach, no hardened-runtime or SIP-protected targets, no arm64e.**
+- **No attach, no hardened-runtime or SIP-protected targets, no arm64e-only or x86_64 programs.**
 - **`fork` and `exec` end the watch** for the child / new image.
 - **Stack variables** are only seen through pointers; **code and read-only file-backed data** cannot be watched.
 - **Granularity is 16 bytes** for trapping. Neighbours in the same granule cost a trap each (filtered from the
@@ -351,11 +358,15 @@ so it is not a usable baseline and I draw no conclusion from it beyond the regis
   program that installs its own Mach exception ports for `EXC_BAD_ACCESS` (some crash reporters do) replaces the
   handler.
 - **LL/SC emulation** uses compare-and-swap and therefore cannot see an A→B→A change between `LDXR` and `STXR`.
+- **Instructions outside the decoder** (SME/streaming-SVE loads and stores) are let through correctly but reported
+  without their width.
+- **`fork` takes a few milliseconds** with the runtime loaded (about 3 ms per fork in `t_fork`): the kernel copies the
+  tag storage of tagwatch's MTE regions, at about 8 ms per GB of MTE mapping (`experiments/vm_behaviour.c`).
 - **Self-modifying or JIT-generated code** that changes an instruction while another thread runs its slot is not
   handled; the slot is rewritten on the next fault at that address.
 - **Backtraces** rely on frame pointers (standard on Apple platforms) and show mangled-name-plus-offset, not
   file and line. The summary demangles C++ names. Tail calls hide frames, as in any debugger.
-- **Overhead** is about 5–9 µs per trapped access. Watching memory that is touched millions of times per second makes
+- **Overhead** is about 5–10 µs per trapped access. Watching memory that is touched millions of times per second makes
   the program thousands of times slower.
 - **Library mode forks** in `tagwatch_init()`, and handlers installed before that call are not wrapped.
 
@@ -374,12 +385,12 @@ JSON reader (round-trip properties), the symboliser (against `dladdr`), and the 
 seeds and print the seed on failure.
 
 GitHub-hosted runners are M1/M2 machines without MTE, so CI builds the MTE tests and reports them as skipped.
-**The MTE tests were run locally on an Apple M5 (macOS 27.0).** Output of `make test` there:
+**The MTE tests were run locally on an Apple M5 (macOS 27.0 26A428), 1 October 2026.** Output of `make test` there:
 
 ```
 ok   fmt            20024 checks
 ok   insn           2379659 checks
-ok   wtab           686182 checks
+ok   wtab           728956 checks
 ok   spec           60069 checks
      (memmove unwind mode 1, leaf 3)
 ok   symtab         233 checks
@@ -387,19 +398,21 @@ ok   json           160033 checks
 ok   report         55 checks
      (sp-relative store to a watched stack slot: not reported, as MTE never checks [sp, #imm] accesses)
 ok   adopt      33 checks
-     (58 watches armed in total, 5 still live in quarantine)
-ok   alloc      75 checks
-ok   basic      62 checks
+     (60 watches armed in total, 5 still live in quarantine)
+ok   alloc      80 checks
+ok   basic      63 checks
 ok   far        8 checks
-ok   fork       16 checks
+     (300 forks under churn: 2.8 ms each)
+ok   fork       18 checks
      (libz crc32 over the watched window: 2 traps; 2 traps so far took the slow return path)
-ok   insn       245 checks
-     (544 timer signals delivered during 20000 traps; all 20544 accesses reported)
+ok   insn       332 checks
+     (693 timer signals delivered during 20000 traps; all 20693 accesses reported)
 ok   signal     25 checks
 ok   syscall    103 checks
-     (9794 accesses caught during 3000 arm/disarm cycles with 4 threads running)
-ok   threads    3041 checks
-ok   cli        53 checks
+     (10529 accesses caught during 3000 arm/disarm cycles with 4 threads running)
+     (81574 refused arms of untaggable or unmapped memory while 4 threads trapped 80000 times)
+ok   threads    3044 checks
+ok   cli        59 checks
 MTE tests passed
 ```
 
@@ -411,12 +424,12 @@ surviving a tag fault, tagging memory the allocator does not tag) are different 
 knowledge, no such tool existed for macOS as of September 2026.
 
 - **Noh et al., "ARM MTE Performance in Practice"** ([arXiv:2601.11786](https://arxiv.org/abs/2601.11786)) includes
-  *MTE-tracer*, a user-space memory tracer on a Pixel 8. As the paper describes it, the tool tags the data of
-  interest, takes the fault in a signal handler, and runs a generated "log, step, resume" snippet that untags the
-  data, re-executes the instruction and retags. tagwatch shares the idea of generated code per fault site. It differs
+  *MTE-tracer*, a user-space memory tracer evaluated on a Pixel 8. As the paper describes it, on a fault the tool runs
+  a dynamically generated "log-step-and-resume" snippet that logs the access, temporarily untags the data, re-executes
+  the faulting instruction and retags. tagwatch shares the idea of generated code per fault site. It differs
   in leaving the tag in place and suppressing the check with `PSTATE.TCO` (which is what makes it safe with threads),
-  in being a watchpoint tool rather than a benchmark subject, and in the platform. Their kernel-assisted variant has
-  no counterpart here.
+  in being a watchpoint tool rather than a benchmark subject, and in the platform. Their kernel-assisted variant
+  (MTE-kernel-tracer, using kprobes) has no counterpart here.
 - **HMTRace** ([arXiv:2404.19139](https://arxiv.org/abs/2404.19139)) uses MTE to detect data races in C programs on
   Armv8.5 Linux: a different question (who races) answered with the same hardware mechanism.
 - **NanoTag** ([github.com/ice-rlab/nanotag](https://github.com/ice-rlab/nanotag), IEEE S&P 2026) gets byte-granular
@@ -426,8 +439,9 @@ knowledge, no such tool existed for macOS as of September 2026.
   is where the spawn SPI used by `tagwatch run` is publicly visible. LLDB uses it to run a program with MTE checking;
   its watchpoints remain the four hardware ones.
 - **Apple-MTE-Research** ([github.com/kaffeindecaf/Apple-MTE-Research](https://github.com/kaffeindecaf/Apple-MTE-Research))
-  and **8kSec's "MIE deep dive"** ([8ksec.io/mie-deep-dive-enabling-apps](https://8ksec.io/mie-deep-dive-enabling-apps/))
-  document how Apple's Memory Integrity Enforcement is enabled and what a tag fault looks like. Neither is a tracing tool.
+  and **8kSec's "MIE Deep Dive Part 2: Enabling Apps & Crash Analysis"**
+  ([8ksec.io/mie-deep-dive-enabling-apps](https://8ksec.io/mie-deep-dive-enabling-apps/), iOS) document how Apple's
+  Memory Integrity Enforcement is enabled and what a tag fault looks like. Neither is a tracing tool.
 - Page-protection watchpoints and hardware watchpoints are the classic alternatives; both are measured above.
 
 ## Scope

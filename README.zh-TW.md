@@ -78,8 +78,8 @@ Access sites, busiest first
 | 私有介面 | `tagwatch run` 用 `posix_spawnattr_set_use_sec_transition_shims_np` 幫子行程開 MTE，這是 libsystem 裡沒公開文件的 SPI（LLDB 的 `process launch --memory-tagging` 用的是同一個呼叫）。Apple 隨時可能改掉。 |
 | 靠「被除錯」才能復原 | 在 macOS 上，標籤檢查錯誤會直接殺掉行程，除非它正被追蹤（ptrace）。所以目標程式會呼叫 `ptrace(PT_TRACE_ME)`，由 tagwatch 當它的追蹤者。一個行程只能有一個追蹤者，所以 LLDB 不能再附加上去；每收到一個訊號也會先短暫停住（見「限制」）。 |
 | 粒度 | MTE 的標籤以 16 位元組為單位。tagwatch 的**回報**精確到位元組（依位址過濾），但同一個粒度裡的每次存取都要付一次攔截的成本。 |
-| 成本 | 在 M5 上每次被攔下的存取大約 **5 微秒**（完整記錄時 7–8 微秒），沒被攔的存取是 0.1 奈秒。監看很熱的記憶體會很慢，見「量測」。 |
-| 不能追蹤的對象 | 開了 hardened runtime 的程式、受 SIP 保護的系統程式（它們會忽略 `DYLD_INSERT_LIBRARIES`；tagwatch 會告訴你，程式照常執行但沒被監看）、arm64e 程式（執行期函式庫只有 arm64 版；未測試）、已經在執行的行程（沒有 attach 功能）。 |
+| 成本 | 在 M5 上每次被攔下的存取大約 **5 微秒**（寫 JSON 追蹤檔加即時記錄時 8–9 微秒），沒被攔的存取是 0.1 奈秒。監看很熱的記憶體會很慢，見「量測」。 |
+| 不能追蹤的對象 | 開了 hardened runtime 的程式、受 SIP 保護的系統程式：它們會忽略 `DYLD_INSERT_LIBRARIES`，所以照常執行但沒被監看，tagwatch 會告訴你。沒有 arm64 程式碼的程式（只有 arm64e、x86_64）：執行期函式庫只有 arm64 版，所以 `tagwatch run` 會直接拒絕並說明原因（同時有 arm64 和 arm64e 的通用二進位檔會以 arm64 執行）。已經在執行的行程：沒有 attach 功能。每一種情況在 `cli.sh` 都有測試。 |
 
 `tagwatch check` 會在你的機器上把這些都檢查一遍，包含實際設一個監看點跑一次：
 
@@ -143,7 +143,13 @@ tagwatch: #2 WRITE 8 bytes at 0x100a70020  watch #1 "g_counter" +0  thread 10410
 ```
 
 追蹤檔（`-t file.jsonl`）每行一個 JSON 物件，種類有 `start`、`watch`、`access`、`free`、`unwatch`、`violation`、
-`note`、`stats`。`tagwatch report [--heatmap] file.jsonl` 可以從存下來的追蹤檔再印一次總結。熱度圖顯示物件的哪些
+`note`、`stats`。
+
+```json
+{"ev":"access","seq":1,"t_ns":234625,"kind":"read","size":8,"addr":"0x102d9c020","watch":1,"off":0,"tid":10410600,"bt":[{"pc":"0x102d948b0","sym":"bump","off":8,"img":"target_list","imgoff":2224},{"pc":"0x102d945d0","sym":"main","off":136,"img":"target_list","imgoff":1488}]}
+```
+
+`tagwatch report [--heatmap] file.jsonl` 可以從存下來的追蹤檔再印一次總結。熱度圖顯示物件的哪些
 部分被碰到，同一種物件會加總在一起：
 
 ```
@@ -187,7 +193,9 @@ codesign -s - --entitlements entitlements/mte.entitlements -f app
 ```
 
 `tagwatch_init()` 要在 `main` 一開始就呼叫：除非行程是 `tagwatch run` 啟動的，否則它會 **fork**，原本的行程留下來
-當追蹤者（見下一節）。完整 API 說明在 [`include/tagwatch.h`](include/tagwatch.h)。
+當追蹤者（見下一節）。[`include/tagwatch.h`](include/tagwatch.h) 說明了完整的 API：`tagwatch_watch`、
+`tagwatch_unwatch`、`tagwatch_alloc`、`tagwatch_adopt`、`tagwatch_peek`／`poke`（碰被監看的記憶體但不產生回報）、
+`tagwatch_pause`／`resume`、每個事件的 callback，以及統計數字。
 
 ## 運作原理
 
@@ -224,8 +232,9 @@ codesign -s - --entitlements entitlements/mte.entitlements -f app
 ### 多執行緒時保證什麼
 
 因為放行某條執行緒時，被監看的粒度仍然帶著監看用的標籤，所以同一時間其他執行緒碰它一樣會出錯。任何執行緒的每一次
-「會做標籤檢查的存取」都恰好被攔一次、恰好生效一次。`t_threads` 用精確的數字驗證這件事（8 條執行緒、36 000 次存取，
-全部有回報、數值全部正確），`t_signal` 則驗證計時器訊號打在正在處理攔截的執行緒上時也成立。
+「會做標籤檢查的存取」都恰好被回報一次、恰好生效一次。`t_threads` 用精確的數字驗證這件事（8 條執行緒、36 000 次
+存取，全部有回報、數值全部正確；另外還有另一條執行緒不停嘗試監看不能上標籤的記憶體時的 80 000 次存取，也全部有回報），`t_signal` 則驗證計時器
+訊號打在正在處理攔截的執行緒上時也成立。
 
 不在保證範圍內的（來自 MTE 或這個機制本身的性質）：
 
@@ -242,9 +251,10 @@ codesign -s - --entitlements entitlements/mte.entitlements -f app
 | --- | --- | --- |
 | 多條執行緒碰同一個粒度 | 全部攔到，數量精確。 | `t_threads`、`t_far` |
 | 別的執行緒在存取時設置／解除監看 | 已經在路上的錯誤會重試，不會被當成真的錯誤。 | `t_threads` |
+| 其他執行緒正被攔截時，去監看不能上標籤（或沒有對應）的記憶體 | 回傳 `TAGWATCH_ENOTTAGGED`，其他執行緒的存取照樣全部回報。（這裡以前會死結，見 DESIGN.md 第 5 節。） | `t_threads` |
 | 對被監看的緩衝區做 `read`/`write`/`pread`/`pwrite`/`recv`/`send`/`fread`/`fwrite` | 核心碰到被設置的粒度會直接致命（下一列），所以改用一塊暫時的緩衝區做系統呼叫，再關掉標籤檢查複製資料，並回報成「核心做的存取」，附上呼叫者的堆疊。 | `t_syscall` |
 | 其他系統呼叫碰到被監看的緩衝區（`readv`、`getcwd`、`ioctl`…） | **沒有處理：** 核心發生致命的標籤錯誤，行程被殺掉（結束碼 137）。 | `cli.sh` |
-| 大塊配置（系統配置器只幫大約 4 KB 以下的區塊上標籤） | 符合條件的配置改由 tagwatch 自己的 MTE 記憶體區提供，大小不限。 | `t_alloc`（測到 70 MB） |
+| 大塊配置（系統配置器只幫 32 KB 以下的區塊上標籤） | 符合條件的配置改由 tagwatch 自己的 MTE 記憶體區提供，大小不限。 | `t_alloc`（測到 70 MB） |
 | 全域變數 | 把所在的分頁就地換成有 MTE 的副本（稱為「收編」，過程中暫停其他執行緒）。`-s` 會自動做。 | `t_adopt`、`cli.sh` |
 | 堆疊記憶體 | 可以收編並監看**別條**執行緒的堆疊；只看得到透過指標的存取。執行緒不能收編自己的堆疊。 | `t_adopt` |
 | 程式碼與唯讀的檔案對應分頁 | 不能收編；`tagwatch_watch` 回傳 `TAGWATCH_ENOTTAGGED`。 | `t_adopt`、`t_basic` |
@@ -256,24 +266,26 @@ codesign -s - --entitlements entitlements/mte.entitlements -f app
 | 系統函式庫裡的程式碼（`memcpy`、`strlen`、zlib…） | 和其他程式碼一樣被追蹤；堆疊能正確穿過葉函式。 | `t_insn` |
 | 離任何空閒位址空間超過 128 MB 的程式碼（dyld 共用快取深處） | 那一小段程式碼跳不回去，改用中斷點結尾：每次存取兩次例外而不是一次。 | `t_far`、`t_insn`（zlib） |
 | `LDXR`/`STXR` 迴圈 | 不能重新執行（出錯會清掉獨佔監視器），所以把這一對模擬成 compare-and-swap。 | `t_insn` |
+| 各種讀寫形式：前／後索引回寫、成對存取（包括會蓋掉自己基底暫存器的成對讀取）、SIMD 結構讀取、LSE 原子操作、`CASP`、RCpc 讀取、`DC ZVA` | 回報精確的位址、寬度和方向；指令的效果、回寫和原子操作的結果都有檢查。 | `t_insn`、`test_insn` 的解碼器向量 |
+| 解碼器不認得的指令（串流模式下的 SME 讀寫） | 一樣放行；回報成錯誤位址上的 1 個位元組，方向取自錯誤症狀暫存器。 | `t_insn` |
 | 程式裡真正的 MTE 違規（目標現在是開著 MTE 在跑） | 附上堆疊回報為「不是監看點」，然後程式照原本會發生的方式結束。 | `cli.sh` |
 
 ## 量測
 
-Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 1 日。量測時機器同時有別的工作在跑（負載
-平均 3–7），數字請當作 ±15%。每個數字是 5 次執行的中位數。用 `make bench` 重現；方法和原始輸出在
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
+Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 1 日，量的是目前提交的程式碼。量測時機器同時
+有別的工作在跑（開始時負載平均約 3），數字請當作 ±15% 或更大的誤差。每個數字是 5 次執行的中位數。用 `make bench`
+重現；方法和原始輸出在 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 
 **每次被攔下的存取**
 
 | 機制 | 每次存取（微秒） |
 | --- | --- |
 | tagwatch，事件只交給 callback，不寫任何東西 | 4.7 |
-| tagwatch，寫出 JSON 記錄（含 16 層已查符號的堆疊） | 6.6 |
-| tagwatch，JSON 記錄加即時記錄 | 7.6 |
-| tagwatch，慢速返回路徑（程式碼離空閒位址太遠，兩次例外） | 8.9 |
-| 換回標籤＋單步執行＋再換標籤（最直覺的設計；已放棄，而且有競爭問題） | 15.5 |
-| `mprotect` 分頁監看（出錯、單步、兩次 `mprotect`） | 16.3 |
+| tagwatch，寫出 JSON 記錄（含已查符號的堆疊） | 7.8 |
+| tagwatch，JSON 記錄加即時記錄 | 8.5 |
+| tagwatch，慢速返回路徑（程式碼離空閒位址太遠，兩次例外） | 9.5 |
+| 換回標籤＋單步執行＋再換標籤（最直覺的設計；已放棄，而且有競爭問題） | 14.8 |
+| `mprotect` 分頁監看（出錯、單步、兩次 `mprotect`） | 16.5 |
 | 沒被攔的存取（對照用） | 0.0001 |
 
 **實際工作負載的額外成本。** `bench/kv.c`：10 萬個堆積節點（各 48 位元組）的雜湊表，對隨機鍵做一百萬次查詢與更新；
@@ -281,17 +293,18 @@ Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 
 
 | 設定 | 時間（毫秒） | 攔截次數 | 變慢倍數 |
 | --- | --- | --- | --- |
-| 原生，沒開 MTE | 10.0 | – | 1.0× |
-| 開 MTE，沒載入 tagwatch（`--no-runtime`） | 10.0 | – | 1.0× |
-| 載入 tagwatch，但沒有符合的物件 | 9.9 | 0 | 1.0× |
-| 監看 1 個節點 | 10.7 | 23 | 1.1× |
-| 監看 10 個節點（萬分之一） | 14.2 | 428 | 1.4× |
-| 100 個節點（千分之一） | 41.3 | 4 068 | 4.1× |
-| 1 000 個節點（百分之一） | 309 | 40 116 | 31× |
-| 10 000 個節點（十分之一） | 2 954 | 405 522 | 295× |
-| 全部 100 000 個節點 | 28 156 | 4 049 194 | 2 800× |
+| 原生，沒開 MTE | 11.3 | – | 基準 |
+| 開 MTE，沒載入 tagwatch（`--no-runtime`） | 9.8 | – | 基準 |
+| 載入 tagwatch，但沒有符合的物件 | 9.9 | 0 | 基準 |
+| 監看 1 個節點 | 10.2 | 23 | 1.0× |
+| 監看 10 個節點（萬分之一） | 14.0 | 428 | 1.4× |
+| 100 個節點（千分之一） | 39.8 | 4 068 | 3.9× |
+| 1 000 個節點（百分之一） | 295 | 40 116 | 29× |
+| 10 000 個節點（十分之一） | 2 653 | 405 522 | 257× |
+| 全部 100 000 個節點 | 25 866 | 4 049 194 | 2 500× |
 
-成本只和被攔下的存取次數成正比（這裡每次約 7 微秒）：大程式裡監看幾個物件幾乎量不出影響，把熱迴圈裡的每個物件都
+前三列在這台共用機器的雜訊範圍內是一樣的（原生那次剛好最慢），所以變慢倍數是對它們的平均 10.3 毫秒計算。
+成本只和被攔下的存取次數成正比（這裡每次約 6.4 微秒）：大程式裡監看幾個物件幾乎量不出影響，把熱迴圈裡的每個物件都
 監看起來則會慢上三個數量級。（操作階段沒有配置記憶體，所以這張表沒有量到配置攔截器的成本；沒有配置規格時，它對
 每次 `malloc` 多一個分支判斷。）
 
@@ -300,18 +313,18 @@ Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 
 
 | 監看對象 | 工具 | 時間（毫秒） | 攔截次數 | 真正碰到被監看節點的次數 | 誤攔比例 |
 | --- | --- | --- | --- | --- | --- |
-| 1 個節點 | tagwatch | 9.8 | 23 | 20（建表時另有 3 次） | 0 |
-| 1 個節點 | mprotect | 32.0 | 1 300 | 20 | 98.5% |
-| 100 個節點 | tagwatch | 43.0 | 4 068 | 3 768（建表時另有 300 次） | 0 |
-| 100 個節點 | mprotect | 20 383 | 1 267 454 | 3 768 | 99.7% |
+| 1 個節點 | tagwatch | 10.2 | 23 | 20（建表時另有 3 次） | 0 |
+| 1 個節點 | mprotect | 31.4 | 1 200 | 20 | 98.3% |
+| 100 個節點 | tagwatch | 42.3 | 4 068 | 3 768（建表時另有 300 次） | 0 |
+| 100 個節點 | mprotect | 20 512 | 1 267 312 | 3 768 | 99.7% |
 
 一個 16 KB 的分頁放得下大約 340 個這種節點，所以分頁監看每攔到一次有用的，就要多攔大約 340 次沒用的。100 個被監看的
-節點分散在 100 個分頁時，它在這個工作負載上比 tagwatch 慢 470 倍。
+節點分散在 100 個分頁時，它在這個工作負載上比 tagwatch 慢 480 倍。
 
 **硬體監看點。** `sysctl hw.optional.watchpoint` 在 M5 上回報 **4** 個除錯暫存器，這就是 LLDB 監看點的上限；
 上面的表格則同時監看了 10 萬個物件。LLDB 本身我沒辦法計時：開發用的機器沒開開發者模式，我也沒有管理員權限，LLDB
-無法啟動行程。替代做法是 `bench/hwwatch.c` 在行程內直接設定同樣的除錯暫存器；有送達的命中每次花 17–33 微秒，但在
-這種用法下只有一小部分命中會送達（記錄的那次是 5 000 次裡 36 次），所以它不能當比較基準，除了暫存器數量之外我不
+無法啟動行程。替代做法是 `bench/hwwatch.c` 在行程內直接設定同樣的除錯暫存器；有送達的命中每次花 17–25 微秒，但在
+這種用法下只有一小部分命中會送達（記錄的那次是 5 000 次裡 11 次），所以它不能當比較基準，除了暫存器數量之外我不
 從中下任何結論。
 
 ## 限制
@@ -322,7 +335,7 @@ Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 
   處理函式執行的情況下回傳 `EINTR`。tagwatch 會替 `wait`、`read`、`write` 系列重試；其他呼叫（`select`、`poll`、
   `nanosleep`、`accept`…）沒有處理，沒有自己處理 `EINTR` 的程式可能出問題。
 - **沒包裝的系統呼叫碰到被監看的記憶體會殺掉行程**（見上表）。
-- **不能 attach；不能用在 hardened runtime 或受 SIP 保護的程式；不支援 arm64e。**
+- **不能 attach；不能用在 hardened runtime 或受 SIP 保護的程式；不支援只有 arm64e 或 x86_64 的程式。**
 - **`fork` 和 `exec` 會結束監看**（對子行程／新程式而言）。
 - **堆疊變數**只看得到透過指標的存取；**程式碼和唯讀的檔案對應資料**不能監看。
 - **攔截的粒度是 16 位元組。** 同一粒度裡的鄰居每次存取都要付一次攔截成本（不會出現在報告裡）。
@@ -331,11 +344,14 @@ Apple M5（10 核心、16 GB）、macOS 27.0、Apple clang 17，2026 年 10 月 
 - **處理程式在行程裡面。** 亂寫記憶體的程式也可能寫壞 tagwatch 的狀態。自己安裝 `EXC_BAD_ACCESS` 例外埠的程式
   （有些當機回報工具會）會把處理程式換掉。
 - **LL/SC 模擬**用 compare-and-swap，看不到 `LDXR` 和 `STXR` 之間 A→B→A 的變化。
+- **解碼器以外的指令**（SME／串流 SVE 的讀寫）會被正確放行，但回報裡沒有存取寬度。
+- **`fork` 要花幾毫秒**（`t_fork` 裡每次約 3 毫秒）：核心會複製 tagwatch 那些 MTE 記憶體區的標籤儲存空間，每 GB 的 MTE
+  對應大約 8 毫秒（`experiments/vm_behaviour.c`）。
 - **會自我修改或 JIT 產生的程式碼**：如果在別的執行緒正在執行那一小段程式碼時改掉指令，沒有處理；下次在同一位址
   出錯時才會重寫。
 - **呼叫堆疊**依賴 frame pointer（Apple 平台的標準做法），顯示的是「符號名稱＋位移」，不是檔名和行號。總結會把
   C++ 名稱還原。尾端呼叫（tail call）會讓某些層消失，和任何除錯器一樣。
-- **成本**是每次被攔的存取 5–9 微秒。監看每秒被碰幾百萬次的記憶體，程式會慢上幾千倍。
+- **成本**是每次被攔的存取 5–10 微秒。監看每秒被碰幾百萬次的記憶體，程式會慢上幾千倍。
 - **函式庫模式會在 `tagwatch_init()` 裡 fork**，而且在那之前安裝的訊號處理函式不會被包裝。
 
 ## 測試
@@ -352,12 +368,12 @@ make mte-test   # 需要 MTE 的全部測試；在其他硬體上會印出 SKIP 
 會印出種子。
 
 GitHub 提供的執行機是沒有 MTE 的 M1/M2，所以 CI 只會把 MTE 測試編譯起來並回報「略過」。
-**MTE 測試是在本機的 Apple M5（macOS 27.0）上跑的。** 在那台機器上 `make test` 的輸出：
+**MTE 測試是在本機的 Apple M5（macOS 27.0 26A428）上跑的，2026 年 10 月 1 日。** 在那台機器上 `make test` 的輸出：
 
 ```
 ok   fmt            20024 checks
 ok   insn           2379659 checks
-ok   wtab           686182 checks
+ok   wtab           728956 checks
 ok   spec           60069 checks
      (memmove unwind mode 1, leaf 3)
 ok   symtab         233 checks
@@ -365,19 +381,21 @@ ok   json           160033 checks
 ok   report         55 checks
      (sp-relative store to a watched stack slot: not reported, as MTE never checks [sp, #imm] accesses)
 ok   adopt      33 checks
-     (58 watches armed in total, 5 still live in quarantine)
-ok   alloc      75 checks
-ok   basic      62 checks
+     (60 watches armed in total, 5 still live in quarantine)
+ok   alloc      80 checks
+ok   basic      63 checks
 ok   far        8 checks
-ok   fork       16 checks
+     (300 forks under churn: 2.8 ms each)
+ok   fork       18 checks
      (libz crc32 over the watched window: 2 traps; 2 traps so far took the slow return path)
-ok   insn       245 checks
-     (544 timer signals delivered during 20000 traps; all 20544 accesses reported)
+ok   insn       332 checks
+     (693 timer signals delivered during 20000 traps; all 20693 accesses reported)
 ok   signal     25 checks
 ok   syscall    103 checks
-     (9794 accesses caught during 3000 arm/disarm cycles with 4 threads running)
-ok   threads    3041 checks
-ok   cli        53 checks
+     (10529 accesses caught during 3000 arm/disarm cycles with 4 threads running)
+     (81574 refused arms of untaggable or unmapped memory while 4 threads trapped 80000 times)
+ok   threads    3044 checks
+ok   cli        59 checks
 MTE tests passed
 ```
 
@@ -389,10 +407,10 @@ MTE tests passed
 工具。
 
 - **Noh 等人，〈ARM MTE Performance in Practice〉**（[arXiv:2601.11786](https://arxiv.org/abs/2601.11786)）裡有
-  *MTE-tracer*，一個在 Pixel 8 上的使用者空間記憶體追蹤工具。依論文的描述，它替目標資料上標籤，在訊號處理函式裡
-  接住錯誤，執行一段動態產生的「記錄、單步、繼續」程式碼：先拿掉標籤、重新執行指令、再把標籤放回去。tagwatch 和它
+  *MTE-tracer*，一個在 Pixel 8 上評估的使用者空間記憶體追蹤工具。依論文的描述，出錯時它執行一段動態產生的
+  「log-step-and-resume」程式碼：記錄這次存取、暫時拿掉資料的標籤、重新執行出錯的指令、再把標籤放回去。tagwatch 和它
   一樣是「每個出錯位置一段產生的程式碼」；不同的地方是 tagwatch 不動標籤，而是用 `PSTATE.TCO` 暫時關掉檢查（所以
-  多執行緒下是安全的），定位是監看點工具而不是效能量測的對象，平台也不同。他們靠核心模組加速的版本，這裡沒有對應物。
+  多執行緒下是安全的），定位是監看點工具而不是效能量測的對象，平台也不同。他們靠核心加速的版本（MTE-kernel-tracer，用 kprobes）這裡沒有對應物。
 - **HMTRace**（[arXiv:2404.19139](https://arxiv.org/abs/2404.19139)）在 Armv8.5 Linux 上用 MTE 偵測 C 程式的資料
   競爭：同一個硬體機制，回答的是另一個問題（誰和誰競爭）。
 - **NanoTag**（[github.com/ice-rlab/nanotag](https://github.com/ice-rlab/nanotag)，IEEE S&P 2026）在 Android 上用
@@ -402,8 +420,9 @@ MTE tests passed
   是 `tagwatch run` 用的那個 spawn SPI 公開可見的出處。LLDB 用它讓程式開著 MTE 檢查執行；它的監看點仍然是那 4 個
   硬體監看點。
 - **Apple-MTE-Research**（[github.com/kaffeindecaf/Apple-MTE-Research](https://github.com/kaffeindecaf/Apple-MTE-Research)）
-  和 **8kSec 的〈MIE deep dive〉**（[8ksec.io/mie-deep-dive-enabling-apps](https://8ksec.io/mie-deep-dive-enabling-apps/)）
-  記錄了 Apple 的 Memory Integrity Enforcement 怎麼啟用、標籤錯誤長什麼樣子。兩者都不是追蹤工具。
+  和 **8kSec 的〈MIE Deep Dive Part 2: Enabling Apps & Crash Analysis〉**
+  （[8ksec.io/mie-deep-dive-enabling-apps](https://8ksec.io/mie-deep-dive-enabling-apps/)，iOS）記錄了 Apple 的
+  Memory Integrity Enforcement 怎麼啟用、標籤錯誤長什麼樣子。兩者都不是追蹤工具。
 - 分頁保護式監看點和硬體監看點是傳統的替代做法，上面都量過了。
 
 ## 用途範圍

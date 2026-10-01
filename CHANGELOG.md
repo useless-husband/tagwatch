@@ -16,3 +16,13 @@ First version.
   globals and other threads' stacks (page adoption), LDXR/STXR sequences (emulated), code far from any free address
   space (two-exception return path).
 - Known limits are listed in the README.
+
+Fixed during the pre-release review, each with a regression test:
+
+- A deadlock: arming untaggable or unmapped memory (or adopting pages) while other threads trapped could hang the
+  process for good. The exception thread no longer waits for the watch lock (`t_threads`).
+- Event `watch` ids, `realloc` of in-place watches, consistency of tags in `fork` children, and a `fork` that took half a
+  second because the arena reserved 64 GB of MTE address space up front (`t_basic`, `t_alloc`, `t_fork`).
+- `tagwatch run` refuses programs with no arm64 code instead of letting dyld abort them, and runs the arm64 slice of
+  an arm64 + arm64e universal binary; the log descriptor is no longer inherited by exec'ed programs (`cli.sh`).
+- `tests/run_mte.sh` kills a hung test (and its traced child) after a time limit instead of hanging `make test`.

@@ -19,12 +19,13 @@ What macOS adds to the problem (all observed on an M5 with macOS 27.0):
 | Fact | Evidence |
 | --- | --- |
 | A process gets MTE only if it is signed with `hardened-process` + `hardened-process.checked-allocations`, or is spawned with `posix_spawnattr_set_use_sec_transition_shims_np`. | tested with each subset of the entitlement keys; `tagwatch check` |
-| Only MTE mappings hold tags: small `malloc` blocks (up to about 4 KB) and memory mapped with `VM_FLAGS_MTE`. `STG` elsewhere raises a bus error; `LDG` elsewhere returns 0. | `experiments/vm_behaviour.c` |
+| Only MTE mappings hold tags: `malloc` blocks of up to 32 KB (32 769 bytes and more come back untagged) and memory mapped with `VM_FLAGS_MTE`. `STG` elsewhere raises a bus error; `LDG` elsewhere returns 0. | `experiments/vm_behaviour.c` (malloc-tags, ldg-plain) |
 | A tag-check fault is delivered as `EXC_BAD_ACCESS` with code `0x106`, and then the process is killed whatever the handler replies. Signal handlers never run. | feasibility probe; `experiments/external_handler.c` |
 | If the process is ptrace-traced, the fault is an ordinary recoverable exception. | same |
 | Soft mode is no use: checking switches off after the first fault. | feasibility probe |
 | When the *kernel* touches a mismatched granule on behalf of a system call, the process is killed and nothing is delivered. | `experiments/vm_behaviour.c`, `tests/mte/cli.sh` |
 | `PSTATE.TCO` (tag check override) can be set from user mode with `MSR TCO`, but not through `thread_set_state`. | `experiments/let_access_proceed.c` |
+| `fork()` copies the tag storage of every MTE mapping, touched or not: about 8 ms per GB (0.9 ms for a fork with no MTE mapping, 10.6 ms with an untouched 1 GB one, 497 ms with 64 GB). | `experiments/vm_behaviour.c` (fork-cost) |
 
 I have not verified *why* tracing changes the outcome; it is an observed kernel policy and could change.
 
@@ -94,7 +95,7 @@ child. This is why the call must come before any other thread exists.
 The faulting instruction cannot succeed as it stands. Five ways out were considered.
 
 **A. Restore the tag, single-step, tag again.** The obvious design, and the one the feasibility probe used. Two
-exceptions per access plus two debug-state system calls: 15.5 µs measured (`bench/naive_step.c`). Worse, while the
+exceptions per access plus two debug-state system calls: 14.8 µs measured (`bench/naive_step.c`). Worse, while the
 original tag is in place any other thread can access the granule unseen. Closing that hole means suspending every
 other thread around every access. Rejected.
 
@@ -125,7 +126,10 @@ executing it, and the granule's tag is not touched. One exception per access: 4.
 
 Why copying the instruction is sound: only loads and stores with a register base take tag-check faults (literal loads
 and `[sp, #imm]` accesses are never checked), and those behave identically at any address. Nothing else in the slot
-reads or writes a general register. A slot is written once and never changed afterwards (unless the code at that
+reads or writes a general register. The slot does not depend on the decoder: an instruction it does not recognise
+(SME loads and stores in streaming mode, for instance; the M5 has SME) is re-executed the same way, and only the report
+is poorer: the fault address, one byte, and the direction from the syndrome register. `t_insn` runs an SME `LD1B`
+into the ZA array from a watched window to check this. A slot is written once and never changed afterwards (unless the code at that
 address changes, which is detected by comparing the instruction word on each fault), so any number of threads can be
 inside the same slot.
 
@@ -133,10 +137,10 @@ inside the same slot.
 register. x16/x17 are scratch only at call boundaries; in the middle of a function they can hold live values, so
 they cannot be borrowed. Slots are therefore allocated near the code they serve: on the first fault in a
 neighbourhood, `tramp.c` walks the VM map for unmapped space within ±120 MB and maps a pool there. This works for the
-program and its libraries. It works for libsystem too, which sits in the first tens of megabytes of the dyld shared
-cache (`memmove` was 59 MB above its start on the test machine), because the address space just below the cache is
-free. Code deep inside the multi-gigabyte shared cache has nothing free within reach. For that, a *far slot* ends in
-`BRK` instead of `B`; the handler sees the breakpoint and sets pc itself. Two exceptions, 8.9 µs, same guarantee.
+program and its libraries. It works for libsystem too, which sits near the start of the dyld shared cache, because the
+address space just below the cache is free: in `t_insn`, the traps in `memcpy`, `memset` and `strlen` all take near
+slots, and only zlib's `crc32` takes the far path. Code deep inside the multi-gigabyte shared cache has nothing free within reach. For that, a *far slot* ends in
+`BRK` instead of `B`; the handler sees the breakpoint and sets pc itself. Two exceptions, 9.5 µs, same guarantee.
 `t_insn` hits this path naturally (zlib's `crc32`), and `t_far` forces it for every access.
 
 **Signals and TCO.** `experiments/vm_behaviour.c` shows that a signal handler inherits `PSTATE.TCO`. If a signal
@@ -144,15 +148,18 @@ arrived while a thread was inside a slot, the whole handler would run unchecked.
 therefore wrap every handler in a small function that clears TCO first. When the handler returns, either `sigreturn`
 restores the bit and the slot continues, or the bit stays clear, the instruction faults inside the slot, and the
 exception thread (which recognises a pc inside a slot) restarts it. Both are correct; `t_signal` checks the outcome
-(exact counts with about 500 timer signals landing during 20 000 traps) without telling the two apart.
+(exact counts with several hundred timer signals landing during 20 000 traps) without telling the two apart.
 
 ## 5. The guarantee with several threads, and the race that was found
 
 Arming and disarming hold one lock while they change the table and the tags together. The handler consults the table
 under the same lock. During an access nothing is changed at all. So:
 
-> Every tag-checked access to an armed granule, by any thread, faults exactly once, is reported once (subject to the
-> read/write and byte-range filters), and then takes effect exactly once.
+> Every tag-checked access to an armed granule, by any thread, is reported once (subject to the read/write and
+> byte-range filters) and takes effect exactly once.
+
+(It may fault more than once before that: a fault that finds the watch lock busy, or that raced with the removal of
+its watch, is simply retried; see below.)
 
 `t_threads` checks the counts exactly: 8 threads × 1500 iterations × 3 accesses = 36 000 events, shared counter and
 private slots all at their expected values.
@@ -165,6 +172,19 @@ in 15–40% of the runs of the churn test. The tag is now read under the lock, t
 The retry is bounded (16 times at one pc), so that a fault whose reported address is not the mismatching granule
 cannot loop forever. The bound only counts while the set of watches is unchanged, because under churn any number of
 retries is legitimate.
+
+A second problem was a deadlock, found in the final review. Arming probes each new page with a guarded `LDG`/`STG`
+that faults on purpose when the page is unmapped or not an MTE mapping, and that fault is resumed by the exception
+thread. The probe runs under the watch lock. If the exception thread was meanwhile handling another thread's trap, it
+waited for that same lock, the prober waited for the exception thread, and the process hung for good (no signal could
+end it, since every thread was either frozen in an exception or blocked). A multi-threaded program that called
+`tagwatch_watch` on a stack or global address, or `tagwatch_adopt`, while other threads trapped could hit it. The
+exception thread now never waits for the watch lock: it spins briefly and, if the lock is still taken, lets the
+faulting thread retry, which frees it to serve the prober first. On its own that can starve the handler when one
+thread arms in a tight loop, so a handler that gave up leaves a timestamp, and program threads hold back for up to
+100 µs before their next acquisition. The third part of `t_threads` (4 threads × 20 000 trapped loads while the main
+thread keeps failing to arm untaggable and unmapped memory) hung every time before the fix; it now finishes in about
+a second with exact counts.
 
 What the guarantee does not include: `[sp, #imm]` accesses (never tag-checked), kernel accesses in unwrapped system
 calls, threads that called `tagwatch_pause()`, and the *order* of events relative to the order in which racing
@@ -190,10 +210,13 @@ find the watch even if the address the CPU reports lies in the unwatched part.
 ## 7. Memory that has no tags
 
 **Heap objects matched by a spec** are not left in the system heap. The system allocator only tags small blocks,
-retags on its own schedule, and would see tagwatch's retagging as corruption. `arena.c` reserves 64 GB of address
-space as one MTE mapping (populated lazily by the kernel), hands out granule-aligned blocks of any size with a 32-byte
-header, and is registered as a malloc zone, so `free`, `realloc` and `malloc_size` on an arena pointer end up there
-even from code the interposers cannot see. Ownership is a range check.
+retags on its own schedule, and would see tagwatch's retagging as corruption. `arena.c` maps MTE regions of 256 MB on
+demand (populated lazily by the kernel; a larger block gets a region of its own), hands out granule-aligned blocks of
+any size with a 32-byte header, and is registered as a malloc zone, so `free`, `realloc` and `malloc_size` on an arena
+pointer end up there even from code the interposers cannot see. Ownership is a range check over the regions. The
+first version reserved 64 GB up front, which looked free until `fork` was measured: the kernel copies the tag storage
+of an MTE mapping whether or not it was touched (section 1), so every `fork` of a traced program took half a second.
+With 256 MB regions a fork costs about 3 ms (`t_fork` prints the figure and fails above 100 ms).
 
 **A block of the system heap watched through the API** is armed in place; the `free`/`realloc` interposers disarm it
 before the allocator sees it again. The allocator does not recognise a block whose first granule is retagged
@@ -235,11 +258,23 @@ for the `wait`, `read` and `write` families retry when `EINTR` comes back and no
 in between (a per-thread counter kept by the handler wrapper), which restores POSIX behaviour for those calls.
 
 **fork.** The child has no exception thread and is not traced, so the `atfork` child handler puts every original tag
-back and detaches from the exception port before any program code runs. `os_unfair_lock` records its owner, so locks
-are re-initialised in the child rather than unlocked.
+back and detaches from the exception port before any program code runs. The forking thread holds the watch lock across
+`fork()`, because the kernel copies the address space one VM entry at a time while other threads keep arming: without
+the lock the child's copy of the table and its copy of the tags could come from different instants. The table marks
+which granules are actually armed, so the child restores exactly those. `os_unfair_lock` records its owner, so locks
+are re-initialised in the child rather than unlocked. `t_fork` forks 300 times while other threads arm and disarm
+continuously and checks that no child ever finds a watch tag.
 
 **exec.** The runtime removes itself from `DYLD_INSERT_LIBRARIES` and drops its `TAGWATCH_*` variables right after
-start-up, so programs launched by the target run clean. The exec'ed image itself also runs without MTE watches.
+start-up, so programs launched by the target run clean. The exec'ed image itself also runs without MTE watches. The
+trace and log descriptors are close-on-exec, so it does not inherit them either (`cli.sh` checks this).
+
+**Programs that cannot be traced.** `tagwatch run` reads the program's Mach-O header first. The runtime is built for
+arm64 only, and dyld aborts a process when an inserted library has the wrong architecture, so a program with no
+arm64 code (arm64e-only or x86_64-only) is refused with that reason. A universal binary with both arm64 and arm64e
+slices would run as arm64e; `posix_spawnattr_setarchpref_np` asks for the arm64 slice instead. Binaries with the
+hardened runtime, and SIP-protected system binaries, ignore `DYLD_INSERT_LIBRARIES`: they run with MTE on but
+unwatched, and the summary says that the runtime never started. Each case has a test in `cli.sh`.
 
 **LDXR/STXR.** Taking an exception clears the CPU's exclusive monitor, so a store-exclusive that traps can never
 succeed and its retry loop would spin forever. The handler emulates the pair the way QEMU does: the load records the
@@ -277,6 +312,10 @@ function.
 - Bugs the tests found, each now covered: the lock held across `fork`; the classification race of section 5; `LDG`
   on an unmapped address; watches left armed inside a freed block; `EINTR` from trace stops; two leak-on-error paths
   and a NULL string table (static analyzer).
+- Found in review, each with a regression test: event `watch` ids that were trace serials rather than the id the
+  caller holds; `realloc` of a block watched in place losing its contents; inconsistent tags in fork children and the
+  half-second fork (section 7); the deadlock of section 5; arm64e programs aborted by dyld with a misleading message;
+  the `tagwatch run` log descriptor leaking into exec'ed programs.
 
 ## 12. Left out
 
