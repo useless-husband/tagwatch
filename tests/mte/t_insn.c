@@ -4,6 +4,7 @@
 // writeback and atomicity results).
 #include "mt.h"
 
+#include <sys/sysctl.h>
 #include <zlib.h>
 
 static uint8_t *blk; // 256-byte arena block; the watch covers [w, w + 64)
@@ -108,6 +109,25 @@ int main(void) {
     expect("strb post-index", W, 1, 3, 1);
     fill();
 
+    // --- pair writeback, and a pair load that overwrites its own base ----------------------
+    base = (uint64_t)(uintptr_t)w;
+    __asm__ volatile("ldp %0, %1, [%2], #16" : "=&r"(v), "=&r"(v2), "+r"(base) : : "memory");
+    CHECK(v == at0 && v2 == at8 && base == (uint64_t)(uintptr_t)w + 16);
+    expect("ldp post-index", R, 16, 0, 1);
+    base = (uint64_t)(uintptr_t)w;
+    __asm__ volatile("ldp %0, %1, [%0, #16]" : "+&r"(base), "=&r"(v2) : : "memory"); // x = [x + 16], x2 = [x + 24]
+    CHECK(base == at16 && v2 == at24);
+    expect("ldp into its base", R, 16, 16, 1);
+    base = (uint64_t)(uintptr_t)w;
+    __asm__ volatile("ldr %0, [%0, #24]" : "+r"(base) : : "memory");
+    CHECK(base == at24);
+    expect("ldr into its base", R, 8, 24, 1);
+    v = 3, v2 = 4;
+    __asm__ volatile("stnp %0, %1, [%2, #32]" : : "r"(v), "r"(v2), "r"(w) : "memory");
+    CHECK(peek64(w + 32) == 3 && peek64(w + 40) == 4);
+    expect("stnp", W, 16, 32, 1);
+    fill();
+
     // --- register offsets ---------------------------------------------------------------
     uint64_t idx = 3;
     __asm__ volatile("ldr %0, [%1, %2, lsl #3]" : "=&r"(v) : "r"(w), "r"(idx) : "memory");
@@ -140,6 +160,19 @@ int main(void) {
     expect("st1 post-index", W, 16, 48, 1);
     __asm__ volatile("ld1r {v0.4s}, [%0]" : : "r"(w + 20) : "v0", "memory");
     expect("ld1r", R, 4, 20, 1);
+    base = (uint64_t)(uintptr_t)w + 4;
+    idx = 12;
+    uint64_t lane = 0;
+    __asm__ volatile("movi v0.16b, #0\n ld1 {v0.s}[1], [%0], %2\n umov %1, v0.d[0]"
+                     : "+r"(base), "=r"(lane)
+                     : "r"(idx)
+                     : "v0", "memory");
+    CHECK(base == (uint64_t)(uintptr_t)w + 16 && (lane >> 32) == (uint32_t)(at0 >> 32));
+    expect("ld1 lane, post-index by register", R, 4, 4, 1);
+    base = (uint64_t)(uintptr_t)w;
+    __asm__ volatile("ld4 {v0.4s, v1.4s, v2.4s, v3.4s}, [%0], #64" : "+r"(base) : : "v0", "v1", "v2", "v3", "memory");
+    CHECK(base == (uint64_t)(uintptr_t)w + 64);
+    expect("ld4 post-index", R, 64, 0, 1);
     fill();
 
     // --- atomics: one instruction, reported once, still atomic ------------------------------
@@ -166,6 +199,25 @@ int main(void) {
     expect("ldar", R, 8, 0, 1);
     __asm__ volatile("stlrb %w0, [%1]" : : "r"(v), "r"(w + 9) : "memory");
     expect("stlrb", W, 1, 9, 1);
+    __asm__ volatile("ldapr %0, [%1]" : "=&r"(v) : "r"(w) : "memory");
+    CHECK(v == 77);
+    expect("ldapr", R, 8, 0, 1);
+    __asm__ volatile("stlur %0, [%1, #-8]" : : "r"(v), "r"(w + 24) : "memory");
+    CHECK(peek64(w + 16) == 77);
+    expect("stlur", W, 8, 16, 1);
+    __asm__ volatile("ldapur %0, [%1, #16]" : "=&r"(v2) : "r"(w) : "memory");
+    CHECK(v2 == 77);
+    expect("ldapur", R, 8, 16, 1);
+    // CASP: 16 bytes compared and swapped as one; the old pair comes back in x0/x1.
+    tagwatch_poke(w + 32, &(uint64_t){5}, 8);
+    tagwatch_poke(w + 40, &(uint64_t){6}, 8);
+    {
+        register uint64_t c0 __asm__("x0") = 5, c1 __asm__("x1") = 6;
+        register uint64_t n0 __asm__("x2") = 50, n1 __asm__("x3") = 60;
+        __asm__ volatile("caspal x0, x1, x2, x3, [%2]" : "+r"(c0), "+r"(c1) : "r"(w + 32), "r"(n0), "r"(n1) : "memory");
+        CHECK(c0 == 5 && c1 == 6 && peek64(w + 32) == 50 && peek64(w + 40) == 60);
+    }
+    expect("caspal", RW, 16, 32, 1);
 
     // --- LL/SC: emulated as compare-and-swap ---------------------------------------------------
     tagwatch_stats s0, s1;
@@ -211,8 +263,35 @@ int main(void) {
                      : "r"(w + 32)
                      : "memory");
     CHECK(peek64(w + 32) == 11 && peek64(w + 40) == 22);
+    uint32_t lo32 = 0, hi32 = 0, lo0, hi0;
+    uint8_t b0;
+    tagwatch_peek(&lo0, w + 48, 4);
+    tagwatch_peek(&hi0, w + 52, 4);
+    tagwatch_peek(&b0, w + 60, 1);
+    __asm__ volatile("1: ldaxp %w0, %w1, [%3]\n"
+                     "   add %w0, %w0, #1\n"
+                     "   add %w1, %w1, #2\n"
+                     "   stlxp %w2, %w0, %w1, [%3]\n"
+                     "   cbnz %w2, 1b\n"
+                     : "=&r"(lo32), "=&r"(hi32), "=&r"(status)
+                     : "r"(w + 48)
+                     : "memory");
+    tagwatch_peek(&lo32, w + 48, 4);
+    tagwatch_peek(&hi32, w + 52, 4);
+    CHECK(lo32 == lo0 + 1 && hi32 == hi0 + 2);
+    uint32_t b8 = 0;
+    __asm__ volatile("1: ldxrb %w0, [%2]\n"
+                     "   add %w0, %w0, #1\n"
+                     "   stxrb %w1, %w0, [%2]\n"
+                     "   cbnz %w1, 1b\n"
+                     : "=&r"(b8), "=&r"(status)
+                     : "r"(w + 60)
+                     : "memory");
+    CHECK(b8 == (uint8_t)(b0 + 1));
+    tagwatch_peek(&b0, w + 60, 1);
+    CHECK(b0 == b8);
     tagwatch_get_stats(&s1);
-    CHECK_EQ(s1.emulated - s0.emulated, 7);
+    CHECK_EQ(s1.emulated - s0.emulated, 11);
     mt_reset();
     fill();
 
@@ -237,6 +316,32 @@ int main(void) {
     __asm__ volatile("ldr %0, [%1, #64]" : "=&r"(v) : "r"(w) : "memory");
     CHECK_EQ(mt_count(), 0);
     fill();
+
+    // --- an instruction the decoder does not know: SME, in streaming mode ---------------------------------
+    // It is still let through (the slot re-executes whatever faulted); the
+    // report falls back to the fault address and the syndrome's direction.
+    int sme = 0;
+    size_t sme_len = sizeof sme;
+    if (sysctlbyname("hw.optional.arm.FEAT_SME", &sme, &sme_len, NULL, 0) == 0 && sme) {
+        uint8_t row[64];
+        memset(row, 0, sizeof row);
+        __asm__ volatile(".arch_extension sme\n"
+                         "smstart\n"
+                         "ptrue p0.b\n"
+                         "mov w12, #0\n"
+                         "ld1b {za0h.b[w12, 0]}, p0/z, [%0]\n"
+                         "ptrue p0.b, vl32\n" // the window is 64 bytes; the row may be longer
+                         "st1b {za0h.b[w12, 0]}, p0, [%1]\n"
+                         "smstop\n"
+                         :
+                         : "r"(w), "r"(row)
+                         : "memory", "x12", "p0");
+        // Only the first 32 bytes were stored back; the load covered the vector length.
+        for (int i = 0; i < 32; i++) CHECK(row[i] == (uint8_t)(w - blk + i));
+        CHECK(mt_count() >= 1);
+        if (mt_count() >= 1) CHECK(mt_events[0].access == R && mt_events[0].size == 1 && mt_events[0].offset >= 0);
+        mt_reset();
+    }
 
     // --- code in system libraries ----------------------------------------------------------------------
     uint8_t copy[64], ref[64];
