@@ -11,8 +11,10 @@ int tw_test_global_a[10] = {1};
 int tw_test_global_b = 2;
 static volatile int sink;
 
-__attribute__((noinline)) int tw_test_with_frame(int x);
-__attribute__((noinline)) int tw_test_with_frame(int x) {
+// ASan's stack redzones around buf change the prologue and with it the
+// compact-unwind encoding (DWARF instead of a plain frame record).
+__attribute__((noinline, no_sanitize("undefined", "address"))) int tw_test_with_frame(int x);
+__attribute__((noinline, no_sanitize("undefined", "address"))) int tw_test_with_frame(int x) {
     char buf[64];
     snprintf(buf, sizeof buf, "%d", x); // a call forces a frame record
     return buf[0];
@@ -75,8 +77,14 @@ int main(void) {
     CHECK(size >= sizeof tw_test_global_b);
     CHECK(!tw_sym_find(NULL, "tw_no_such_symbol", &addr, &size));
     CHECK(!tw_sym_find("libnothere.dylib", "tw_test_global_a", &addr, &size));
+    // Checked with dladdr rather than dlsym(RTLD_DEFAULT): under ASan, dlsym
+    // returns the sanitizer's interceptor, not libsystem_c's printf.
     CHECK(tw_sym_find("libsystem_c.dylib", "printf", &addr, &size));
-    CHECK(addr == ((uint64_t)(uintptr_t)dlsym(RTLD_DEFAULT, "printf") & 0x00007fffffffffffull));
+    Dl_info pdi;
+    CHECK(dladdr((void *)(uintptr_t)addr, &pdi) != 0);
+    CHECK((uint64_t)(uintptr_t)pdi.dli_saddr == addr);
+    CHECK(pdi.dli_sname && strcmp(pdi.dli_sname, "printf") == 0);
+    CHECK(pdi.dli_fname && strstr(pdi.dli_fname, "libsystem_c.dylib") != NULL);
 
     // Compact unwind: a function that calls others keeps a frame record; a
     // leaf does not, so its caller is only found through x30.
@@ -84,7 +92,11 @@ int main(void) {
     int leaf = tw_unwind_mode((uint64_t)(uintptr_t)tw_test_leaf);
     CHECK(leaf == TW_UNW_FRAMELESS || leaf == TW_UNW_NONE);
     CHECK_EQ(tw_unwind_mode(0x10), TW_UNW_UNKNOWN);
-    int mm = tw_unwind_mode((uint64_t)(uintptr_t)dlsym(RTLD_DEFAULT, "memmove") & 0x00007fffffffffffull);
+    // memmove is libsystem_platform's _platform_memmove; looked up there by
+    // name because under ASan dlsym("memmove") is the interceptor.
+    uint64_t mmaddr = 0, mmsize = 0;
+    CHECK(tw_sym_find("libsystem_platform.dylib", "_platform_memmove", &mmaddr, &mmsize));
+    int mm = tw_unwind_mode(mmaddr);
     printf("     (memmove unwind mode %d, leaf %d)\n", mm, leaf);
     CHECK(mm != TW_UNW_FRAME); // hand-written leaf routine: no frame record
 
