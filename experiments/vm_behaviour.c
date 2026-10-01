@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #ifndef VM_FLAGS_MTE
 #define VM_FLAGS_MTE 0x2000
@@ -108,6 +109,48 @@ static void t_syscall_write(void) {
     ssize_t r = write(fds[1], p, 5);
     printf("    write returned %zd errno=%d\n", r, r < 0 ? errno : 0);
 }
+// Which malloc sizes come back tagged? A tagged block's pointer carries a
+// random tag that matches the memory's tag (LDG); eight blocks that all
+// have tag 0 means the size is served from untagged memory.
+static void t_malloc_tags(void) {
+    static const size_t sizes[] = {16, 1024, 4096, 8192, 16384, 24576, 32768, 32769, 49152, 65536, 1 << 20};
+    for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        int tagged = 0;
+        for (int k = 0; k < 8; k++) {
+            void *p = malloc(sizes[i]);
+            tagged |= TAG(p) != 0 && TAG(p) == ldg(p);
+        }
+        printf("    malloc(%7zu): %s\n", sizes[i], tagged ? "tagged" : "untagged");
+    }
+}
+// fork() cost against the size of an untouched MTE mapping (the arena used
+// to reserve 64 GB up front).
+static double fork_ms(void) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const int n = 5;
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) _exit(0);
+        int st;
+        waitpid(pid, &st, 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return ((t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6) / n;
+}
+static void t_fork_cost(void) {
+    static const unsigned gb[] = {0, 1, 4, 16, 64};
+    for (unsigned i = 0; i < sizeof gb / sizeof gb[0]; i++) {
+        mach_vm_address_t a = 0;
+        if (gb[i] && mach_vm_map(mach_task_self(), &a, (mach_vm_size_t)gb[i] << 30, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_MTE, MACH_PORT_NULL,
+                                 0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT) != KERN_SUCCESS) {
+            printf("    %2u GB: map failed\n", gb[i]);
+            continue;
+        }
+        printf("    fork with an untouched %2u GB MTE mapping: %.2f ms\n", gb[i], fork_ms());
+        if (gb[i]) mach_vm_deallocate(mach_task_self(), a, (mach_vm_size_t)gb[i] << 30);
+    }
+}
 int main(void) {
     setvbuf(stdout, 0, _IOLBF, 0);
     run("reserve", t_reserve);
@@ -117,5 +160,7 @@ int main(void) {
     run("tco-signal", t_tco_signal);
     run("syscall-read", t_syscall_read);
     run("syscall-write", t_syscall_write);
+    run("malloc-tags", t_malloc_tags);
+    run("fork-cost", t_fork_cost);
     return 0;
 }

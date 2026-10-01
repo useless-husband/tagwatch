@@ -1,7 +1,7 @@
 // arena: tagwatch's own allocator for watched objects.
 //
 // Watched allocations are not left in the system heap. The system allocator
-// only tags small blocks (on the test machine, up to about 4 KB), retags
+// only tags small blocks (on the test machine, up to 32 KB), retags
 // memory on its own schedule, and rounds sizes in ways that make neighbours
 // share granules. Here every block starts on a granule boundary, occupies
 // whole granules, can be any size, and nobody else changes its tags.
@@ -11,8 +11,9 @@
 // Regions are mapped on demand, 256 MB at a time (a block larger than that
 // gets a region of its own), rather than as one huge reservation up front:
 // fork() copies the tag storage of an MTE mapping whether or not its pages
-// were ever touched, at about 8 ms per GB on the M5, so the reservation must
-// stay in proportion to what the program actually watches. The arena is
+// were ever touched, at about 8 ms per GB on the M5 (experiments/
+// vm_behaviour.c, fork-cost), so the reservation must stay in proportion to
+// what the program actually watches. The arena is
 // registered as a malloc zone: free(), realloc() and malloc_size() on an
 // arena block find their way here even when called from code the
 // interposers cannot see.
