@@ -1,6 +1,7 @@
 // Target for the CLI tests of process-level behaviour: exit codes, fatal
 // signals, exec, fork, signal forwarding, and the two fatal cases (a system
 // call tagwatch does not shim, and a genuine MTE violation).
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "abort")) abort();
     if (!strcmp(mode, "hello")) {
         printf("hello from the exec'ed image (DYLD_INSERT_LIBRARIES=%s)\n", getenv("DYLD_INSERT_LIBRARIES") ? "set" : "unset");
+        int inherited = 0;
+        for (int fd = 3; fd < 1024; fd++) inherited += fcntl(fd, F_GETFD) != -1;
+        printf("descriptors inherited beyond stdio: %d\n", inherited);
         return 0;
     }
     if (!strcmp(mode, "exec")) {

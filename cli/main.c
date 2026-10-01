@@ -6,8 +6,12 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libkern/OSByteOrder.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
+#include <mach/machine.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -114,9 +118,62 @@ static int find_program(const char *name, char *out) {
     return -1;
 }
 
+// Which architectures the program file contains. libtagwatch.dylib is arm64
+// only: dyld refuses to insert it into an arm64e or x86_64 process and
+// aborts the program before main. A file with both arm64 and arm64e slices
+// would run as arm64e unless the arm64 slice is asked for.
+typedef struct {
+    int macho, arm64, arm64e, x86_64, other;
+} arch_info;
+
+static void note_slice(arch_info *ai, uint32_t cputype, uint32_t subtype) {
+    if (cputype == CPU_TYPE_X86_64) ai->x86_64 = 1;
+    else if (cputype != CPU_TYPE_ARM64) ai->other = 1;
+    else if ((subtype & ~CPU_SUBTYPE_MASK) <= CPU_SUBTYPE_ARM64_V8 && !(subtype & CPU_SUBTYPE_PTRAUTH_ABI)) ai->arm64 = 1;
+    else ai->arm64e = 1; // arm64e and its variants (e.g. subtype 12, "arm64e.x1")
+}
+
+static void program_arch(const char *path, arch_info *ai) {
+    memset(ai, 0, sizeof *ai);
+    unsigned char buf[4096];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof buf);
+    close(fd);
+    if (n < 8) return;
+    uint32_t magic;
+    memcpy(&magic, buf, 4);
+    if (magic == MH_MAGIC_64 && n >= (ssize_t)sizeof(struct mach_header_64)) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)(const void *)buf;
+        ai->macho = 1;
+        note_slice(ai, (uint32_t)mh->cputype, (uint32_t)mh->cpusubtype);
+        return;
+    }
+    if (magic == MH_MAGIC) {
+        ai->macho = ai->other = 1;
+        return;
+    }
+    uint32_t be = OSSwapBigToHostInt32(magic);
+    if (be != FAT_MAGIC && be != FAT_MAGIC_64) return;
+    uint32_t nfat = OSSwapBigToHostInt32(((const struct fat_header *)(const void *)buf)->nfat_arch);
+    size_t entry = be == FAT_MAGIC ? sizeof(struct fat_arch) : sizeof(struct fat_arch_64);
+    if (nfat == 0 || nfat > 32 || sizeof(struct fat_header) + nfat * entry > (size_t)n) return; // not a fat Mach-O (or a Java class file)
+    ai->macho = 1;
+    for (uint32_t i = 0; i < nfat; i++) {
+        // cputype and cpusubtype lead both fat_arch and fat_arch_64.
+        const unsigned char *e = buf + sizeof(struct fat_header) + i * entry;
+        uint32_t ct, st;
+        memcpy(&ct, e, 4);
+        memcpy(&st, e + 4, 4);
+        note_slice(ai, OSSwapBigToHostInt32(ct), OSSwapBigToHostInt32(st));
+    }
+}
+
 // Launches argv with MTE enabled and the runtime inserted; returns the pid.
 // lib == NULL starts the program with MTE on but without the runtime.
-static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr, char *const extra_env[], int n_extra) {
+// prefer_arm64 selects the arm64 slice of a file that also has others.
+static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr, int prefer_arm64, char *const extra_env[],
+                    int n_extra) {
     shim_fn set_shims = (shim_fn)dlsym(RTLD_DEFAULT, SHIM_SPI);
     if (!set_shims) {
         fprintf(stderr, "tagwatch: this macOS has no " SHIM_SPI "; cannot enable MTE for the program\n");
@@ -127,6 +184,7 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     // Flags 0: the same call LLDB's `process launch --memory-tagging` makes.
     if (set_shims(&attr, 0) != 0) {
         fprintf(stderr, "tagwatch: " SHIM_SPI " failed\n");
+        posix_spawnattr_destroy(&attr);
         return -1;
     }
     short flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
@@ -137,18 +195,28 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     posix_spawnattr_setsigmask(&attr, &none);
     posix_spawnattr_setsigdefault(&attr, &all);
     posix_spawnattr_setflags(&attr, flags);
+    if (prefer_arm64) {
+        cpu_type_t ct = CPU_TYPE_ARM64;
+        cpu_subtype_t st = CPU_SUBTYPE_ARM64_ALL;
+        size_t set = 0;
+        posix_spawnattr_setarchpref_np(&attr, 1, &ct, &st, &set);
+    }
 
     // Environment: ours plus the insertion and the configuration.
     size_t n_env = 0;
     while (environ[n_env]) n_env++;
     char **env = calloc(n_env + (size_t)n_extra + 2, sizeof *env);
-    if (!env) return -1;
+    if (!env) {
+        posix_spawnattr_destroy(&attr);
+        return -1;
+    }
     size_t k = 0;
     char *insert = NULL;
     for (size_t i = 0; i < n_env; i++) {
         if (lib && !strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22)) {
             if (asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s:%s", lib, environ[i] + 22) < 0) {
                 free(env);
+                posix_spawnattr_destroy(&attr);
                 return -1;
             }
             continue;
@@ -158,6 +226,7 @@ static pid_t launch(const char *prog, char **argv, const char *lib, int no_aslr,
     }
     if (lib && !insert && asprintf(&insert, "DYLD_INSERT_LIBRARIES=%s", lib) < 0) {
         free(env);
+        posix_spawnattr_destroy(&attr);
         return -1;
     }
     if (insert) env[k++] = insert;
@@ -323,6 +392,23 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "tagwatch: %s: not found or not executable\n", argv[i]);
         return 2;
     }
+    arch_info arch;
+    program_arch(prog, &arch);
+    // SIP-protected system binaries (arm64e) are left alone: dyld ignores the
+    // insertion there, so they run, unwatched, and the summary says so.
+    struct stat pst;
+    int sip = stat(prog, &pst) == 0 && (pst.st_flags & SF_RESTRICTED);
+    if (arch.macho && !arch.arm64 && !no_runtime && !sip) {
+        char has[64] = "";
+        if (arch.arm64e) strlcat(has, "arm64e", sizeof has);
+        if (arch.x86_64) strlcat(has, has[0] ? ", x86_64" : "x86_64", sizeof has);
+        if (arch.other) strlcat(has, has[0] ? ", other" : "other", sizeof has);
+        fprintf(stderr,
+                "tagwatch: %s contains no arm64 code (only %s); libtagwatch.dylib is built for arm64 and\n"
+                "tagwatch: cannot be inserted into it. Rebuild the program with -arch arm64.\n",
+                prog, has);
+        return 2;
+    }
 
     // The summary is built from the trace, so there is always one; it is a
     // temporary file unless the user asked to keep it.
@@ -381,7 +467,7 @@ static int cmd_run(int argc, char **argv) {
         extra[ne++] = env_pair("TAGWATCH_QUARANTINE", num);
     }
 
-    pid_t pid = launch(prog, argv + i, no_runtime ? NULL : lib, no_aslr, extra, ne);
+    pid_t pid = launch(prog, argv + i, no_runtime ? NULL : lib, no_aslr, arch.arm64, extra, ne);
     if (pid < 0) {
         if (temp) unlink(tmp_trace);
         return 2;
@@ -403,8 +489,8 @@ static int cmd_run(int argc, char **argv) {
         if (!tot.started)
             fprintf(stderr, "tagwatch: the runtime never started inside %s, so nothing was watched.\n"
                             "tagwatch: binaries with the hardened runtime, and system binaries protected by SIP, ignore\n"
-                            "tagwatch: DYLD_INSERT_LIBRARIES and cannot be traced.\n",
-                    prog);
+                            "tagwatch: DYLD_INSERT_LIBRARIES and cannot be traced%s.\n",
+                    prog, arch.macho ? "" : " (for a script, this applies to its interpreter)");
         else if (!no_summary) {
             fputc('\n', stderr);
             tw_report_print(rep, stderr);
@@ -489,7 +575,7 @@ static int cmd_check(int argc, char **argv) {
         uint64_t accesses = 0;
         int status = -1;
         if (fd >= 0 && _NSGetExecutablePath(exe, &n) == 0 && realpath(exe, real)) {
-            pid_t pid = launch(real, child_argv, lib, 0, extra, 5);
+            pid_t pid = launch(real, child_argv, lib, 0, 1, extra, 5);
             if (pid > 0) {
                 status = tw_supervise(pid, NULL);
                 tw_report_opts o;

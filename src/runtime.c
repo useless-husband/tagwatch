@@ -1,5 +1,7 @@
 // runtime: initialisation, the public API, and the glue between modules.
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -180,7 +182,10 @@ static int init_once(void) {
     if (log) {
         uint64_t fd;
         if (!strcmp(log, "none")) log_fd = -1;
-        else if (tw_parse_u64(log, strlen(log), &fd) == 0) log_fd = (int)fd;
+        else if (tw_parse_u64(log, strlen(log), &fd) == 0 && fd < INT_MAX) log_fd = (int)fd;
+        // A descriptor handed over by `tagwatch run` is ours; programs the
+        // target executes must not inherit it.
+        if (log_fd > 2) fcntl(log_fd, F_SETFD, FD_CLOEXEC);
     }
     tw_out_set(log_fd, trace && trace[0] ? trace : NULL);
     tw_symtab_init();

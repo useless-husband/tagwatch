@@ -85,6 +85,8 @@ ok "abort(): termination reported" has "terminated by signal 6" "$TMP/j.err"
 ok "exec: status 0" eq $? 0
 ok "exec: new image ran without the inserted library" has "hello from the exec'ed image (DYLD_INSERT_LIBRARIES=unset)" "$TMP/k.out"
 ok "exec: only the first image was traced" eq "$(count '"ev":"start"' "$TMP/k.jsonl")" 1
+"$T" run --no-summary -l "$TMP/k2.log" -a size=4000 -- "$B/mte/target_misc" exec >"$TMP/k2.out" 2>&1
+ok "exec: the new image inherits neither the trace nor the log descriptor" has "descriptors inherited beyond stdio: 0" "$TMP/k2.out"
 
 # --- fork and child processes -------------------------------------------------------------------------
 "$T" run -q --no-summary -t "$TMP/l.jsonl" -a size=4000 -- "$B/mte/target_misc" fork >"$TMP/l.out" 2>&1
@@ -120,6 +122,21 @@ ok "genuine MTE violation: shown in the summary" has "Violation 1: read at 0x" "
 "$T" run -q -a size=48 -- /bin/ls / >"$TMP/q.out" 2>"$TMP/q.err"
 ok "SIP-protected binary: still runs" eq $? 0
 ok "SIP-protected binary: tagwatch says nothing was watched" has "the runtime never started" "$TMP/q.err"
+# Built here rather than committed: one 48-byte object, one write and one read.
+printf '%s\n' '#include <stdio.h>' '#include <stdlib.h>' \
+    'int main(void) { volatile char *p = malloc(48); p[3] = 1; printf("value %d\n", p[3]); free((void *)p); return 0; }' \
+    >"$TMP/one.c"
+${CC:-cc} -arch arm64 -o "$TMP/hardened" "$TMP/one.c" && codesign -s - -o runtime -f "$TMP/hardened" 2>/dev/null
+"$T" run -q -a size=48 -- "$TMP/hardened" >"$TMP/hr.out" 2>"$TMP/hr.err"
+ok "hardened-runtime binary: still runs" eq "$?:$(cat "$TMP/hr.out")" "0:value 1"
+ok "hardened-runtime binary: tagwatch says nothing was watched" has "the runtime never started" "$TMP/hr.err"
+${CC:-cc} -arch arm64e -o "$TMP/only_e" "$TMP/one.c"
+"$T" run -q -a size=48 -- "$TMP/only_e" >/dev/null 2>"$TMP/e.err"
+ok "arm64e-only binary: refused up front (exit 2)" eq $? 2
+ok "arm64e-only binary: the reason is given" has "contains no arm64 code (only arm64e)" "$TMP/e.err"
+${CC:-cc} -arch arm64 -arch arm64e -o "$TMP/fat" "$TMP/one.c"
+"$T" run -q --no-summary -t "$TMP/fat.jsonl" -a size=48 -- "$TMP/fat" >/dev/null 2>&1
+ok "arm64 + arm64e binary: the arm64 slice runs, traced" eq "$?:$(count '"ev":"access"' "$TMP/fat.jsonl")" "0:2"
 
 # --- usage errors -------------------------------------------------------------------------------------------------
 "$T" run -a bogus=1 -- "$B/mte/target_list" >/dev/null 2>"$TMP/r.err"
