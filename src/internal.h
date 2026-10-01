@@ -81,6 +81,12 @@ int tw_watch_mark_freed(uint64_t addr, uint64_t len);
 // *tag_now (if not NULL) receives the current tag of the faulting granule.
 int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
                  unsigned *tag_now);
+// The exception thread's variants never wait for the watch lock (watch.c
+// explains why): when it is busy they return -1 / -TAGWATCH_EBUSY and the
+// handler lets the faulting thread take the fault again.
+int tw_watch_hit_handler(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+                         unsigned *tag_now);
+int tw_watch_remove_addr_handler(uint64_t addr, const char *reason);
 // 1 if any granule of [addr, addr+len) is armed (cheap when nothing is).
 int tw_watch_overlaps(uint64_t addr, uint64_t len);
 // Restores the original tag of every armed granule (fork child).

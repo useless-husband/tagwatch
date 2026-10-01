@@ -7,8 +7,13 @@
 //
 // One lock protects the table and the records. It is never held while
 // touching program memory through ordinary (tag-checked) accesses, so the
-// thread holding it cannot take a watch fault and deadlock the handler.
+// thread holding it cannot take a watch fault. It can take a fault of
+// another kind, though: the guarded LDG/STG probes (mte.c) fault on purpose,
+// under this lock, when memory is unmapped or not taggable, and only the
+// exception thread can resume them. The exception thread therefore never
+// waits for this lock (see lock_for_handler).
 #include <errno.h>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -43,6 +48,41 @@ static inline int in_own_fork(void) {
     return t != NULL && pthread_equal(t, pthread_self());
 }
 
+// The exception thread's way of taking the lock: a short spin, then give up.
+// Blocking could deadlock: the holder may be stopped in a guarded probe
+// whose fault message waits, behind the one being handled, for this very
+// thread. The caller lets the faulting thread retry instead, which frees the
+// exception thread to serve the holder's fault first.
+//
+// Giving up alone can starve the handler: a thread that arms in a tight loop
+// (worst when every attempt faults in a probe) holds the lock nearly all the
+// time. So a handler that gave up leaves a timestamp, and program threads
+// hold back for a moment before their next acquisition, letting the retried
+// fault in. The wait is bounded because that fault may never come back
+// (its watch may be gone by then).
+static _Atomic uint64_t handler_gave_up; // mach_absolute_time() | 1, or 0
+static uint64_t holdback_ticks = 2400;   // 100 us at 24 MHz; set from the timebase
+
+static int lock_for_handler(void) {
+    for (int i = 0; i < 256; i++) {
+        if (os_unfair_lock_trylock(&lock)) {
+            if (atomic_load_explicit(&handler_gave_up, memory_order_relaxed))
+                atomic_store_explicit(&handler_gave_up, 0, memory_order_relaxed);
+            return 1;
+        }
+        __asm__ volatile("isb" ::: "memory");
+    }
+    atomic_store_explicit(&handler_gave_up, mach_absolute_time() | 1, memory_order_relaxed);
+    return 0;
+}
+
+static void lock_prog(void) {
+    uint64_t t = atomic_load_explicit(&handler_gave_up, memory_order_relaxed);
+    while (t && atomic_load_explicit(&handler_gave_up, memory_order_relaxed) == t && mach_absolute_time() - t < holdback_ticks)
+        __asm__ volatile("isb" ::: "memory");
+    os_unfair_lock_lock(&lock);
+}
+
 static uint32_t slot_alloc(void) {
     if (free_head) {
         uint32_t s = free_head;
@@ -68,7 +108,11 @@ static void slot_free(uint32_t s) {
 // id can be told apart from the slot's next tenant.
 static tagwatch_id make_id(uint32_t slot, uint64_t serial) { return (tagwatch_id)((serial << ID_SHIFT) | slot); }
 
-int tw_watch_module_init(void) { return tw_wtab_init(&table, &tw_vm_mem); }
+int tw_watch_module_init(void) {
+    mach_timebase_info_data_t tb;
+    if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer) holdback_ticks = 100000ull * tb.denom / tb.numer;
+    return tw_wtab_init(&table, &tw_vm_mem);
+}
 
 static void disarm_locked(uint32_t slot) {
     tw_watch *w = slot_ptr(slot);
@@ -92,7 +136,7 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     uint64_t glen = ((addr + len + TW_GRANULE_MASK) & ~TW_GRANULE_MASK) - gbase;
     if (in_own_fork()) return -TAGWATCH_EBUSY;
 
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     uint32_t slot = slot_alloc();
     if (!slot) {
         os_unfair_lock_unlock(&lock);
@@ -156,9 +200,10 @@ tagwatch_id tw_watch_add(uint64_t addr, uint64_t len, const char *label, unsigne
     return copy.id;
 }
 
-static int remove_slot(uint32_t slot, uint64_t serial_or_zero, const char *reason) {
+static int remove_slot(uint32_t slot, uint64_t serial_or_zero, const char *reason, int from_handler) {
     if (in_own_fork()) return -TAGWATCH_ENOENT;
-    os_unfair_lock_lock(&lock);
+    if (!from_handler) lock_prog();
+    else if (!lock_for_handler()) return -TAGWATCH_EBUSY;
     if (slot == 0 || slot >= n_slots) {
         os_unfair_lock_unlock(&lock);
         return -TAGWATCH_ENOENT;
@@ -178,17 +223,21 @@ static int remove_slot(uint32_t slot, uint64_t serial_or_zero, const char *reaso
 
 int tw_watch_remove_id(tagwatch_id id, const char *reason) {
     if (id <= 0) return -TAGWATCH_ENOENT;
-    return remove_slot((uint32_t)(id & TW_SLOT_MAX), (uint64_t)id >> ID_SHIFT, reason);
+    return remove_slot((uint32_t)(id & TW_SLOT_MAX), (uint64_t)id >> ID_SHIFT, reason, 0);
 }
 
-int tw_watch_remove_addr(uint64_t addr, const char *reason) {
+static int remove_addr(uint64_t addr, const char *reason, int from_handler) {
     if (in_own_fork()) return -TAGWATCH_ENOENT;
-    os_unfair_lock_lock(&lock);
+    if (!from_handler) lock_prog();
+    else if (!lock_for_handler()) return -TAGWATCH_EBUSY;
     uint32_t slot = tw_wtab_get(&table, addr & TW_ADDR_MASK, NULL);
     os_unfair_lock_unlock(&lock);
     // A concurrent remove of the same watch makes the second one a no-op.
-    return slot ? remove_slot(slot, 0, reason) : -TAGWATCH_ENOENT;
+    return slot ? remove_slot(slot, 0, reason, from_handler) : -TAGWATCH_ENOENT;
 }
+
+int tw_watch_remove_addr(uint64_t addr, const char *reason) { return remove_addr(addr, reason, 0); }
+int tw_watch_remove_addr_handler(uint64_t addr, const char *reason) { return remove_addr(addr, reason, 1); }
 
 // Removes every watch that intersects [addr, addr+len). Returns how many.
 int tw_watch_remove_range(uint64_t addr, uint64_t len, const char *reason) {
@@ -196,11 +245,11 @@ int tw_watch_remove_range(uint64_t addr, uint64_t len, const char *reason) {
     addr &= TW_ADDR_MASK;
     if (in_own_fork()) return 0;
     for (;;) {
-        os_unfair_lock_lock(&lock);
+        lock_prog();
         uint32_t slot = tw_wtab_find(&table, addr, len, NULL);
         os_unfair_lock_unlock(&lock);
         if (!slot) return n;
-        if (remove_slot(slot, 0, reason) == 0) n++;
+        if (remove_slot(slot, 0, reason, 0) == 0) n++;
     }
 }
 
@@ -212,7 +261,7 @@ int tw_watch_mark_freed(uint64_t addr, uint64_t len) {
     addr &= TW_ADDR_MASK;
     uint64_t end = addr + len;
     if (in_own_fork()) return 0;
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     while (addr < end) {
         uint64_t hit = 0;
         uint32_t slot = tw_wtab_find(&table, addr, end - addr, &hit);
@@ -230,12 +279,13 @@ int tw_watch_mark_freed(uint64_t addr, uint64_t len) {
     return n;
 }
 
-int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
-                 unsigned *tag_now) {
+static int hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+               unsigned *tag_now, int from_handler) {
     ea &= TW_ADDR_MASK;
     far &= TW_ADDR_MASK;
     if (in_own_fork()) return 0;
-    os_unfair_lock_lock(&lock);
+    if (!from_handler) lock_prog();
+    else if (!lock_for_handler()) return -1;
     uint32_t slot = size ? tw_wtab_find(&table, ea, size, NULL) : 0;
     if (!slot) slot = tw_wtab_get(&table, far, NULL);
     if (!slot) {
@@ -260,9 +310,19 @@ int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_w
     return 1;
 }
 
+int tw_watch_hit(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+                 unsigned *tag_now) {
+    return hit(ea, size, far, access, out, slack, tag_now, 0);
+}
+
+int tw_watch_hit_handler(uint64_t ea, uint64_t size, uint64_t far, unsigned access, tw_watch *out, uint64_t *slack,
+                         unsigned *tag_now) {
+    return hit(ea, size, far, access, out, slack, tag_now, 1);
+}
+
 int tw_watch_overlaps(uint64_t addr, uint64_t len) {
     if (atomic_load_explicit(&tw_armed_granules, memory_order_relaxed) == 0 || len == 0 || in_own_fork()) return 0;
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     uint32_t slot = tw_wtab_find(&table, addr & TW_ADDR_MASK, len, NULL);
     os_unfair_lock_unlock(&lock);
     return slot != 0;
@@ -281,7 +341,7 @@ static void restore_tag(uint64_t addr, unsigned orig_tag, void *ctx) {
 // consistent. (wtab.c additionally orders its stores so that a snapshot
 // taken mid-operation is safe to walk, but that alone is not enough.)
 void tw_watch_before_fork(void) {
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     atomic_store(&fork_thread, pthread_self());
 }
 void tw_watch_after_fork_parent(void) {
@@ -310,7 +370,7 @@ void tw_watch_disarm_all(void) {
 // with a watch being armed or disarmed on the same granule.
 int tw_watch_page_taggable(uint64_t addr) {
     if (in_own_fork()) return 0;
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     int tag = tw_mte_try_get_tag(addr);
     int ok = tag >= 0 && tw_mte_try_set_tag(addr, (unsigned)tag) == 0;
     os_unfair_lock_unlock(&lock);
@@ -322,7 +382,7 @@ void tw_watch_counts(uint64_t *live, uint64_t *total, uint64_t *granules) {
         *live = *total = *granules = 0;
         return;
     }
-    os_unfair_lock_lock(&lock);
+    lock_prog();
     *live = live_watches;
     *total = total_watches;
     *granules = table.granules;

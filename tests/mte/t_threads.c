@@ -3,6 +3,8 @@
 // all seen. The counts below are exact, not lower bounds.
 #include "mt.h"
 
+#include <sys/mman.h>
+
 #define THREADS 8
 #define ITERS 1500
 
@@ -26,6 +28,19 @@ static void *hammer(void *arg) {
 // Arm/disarm churn while other threads keep accessing the object.
 static uint64_t *churn_obj;
 static _Atomic int churn_stop;
+
+// Failed arms while other threads trap. Arming memory that cannot be tagged
+// (or is not mapped) faults on purpose inside the watch lock, and only the
+// exception thread can resume that fault; it used to wait for the same lock
+// while handling another thread's trap, and the process hung for good.
+#define PROBE_ITERS 20000
+static uint64_t *probe_obj;
+static long g_untaggable[4]; // __DATA: not in an MTE mapping
+static void *probe_reader(void *arg) {
+    long me = (long)arg;
+    for (int i = 0; i < PROBE_ITERS; i++) (void)load64(probe_obj + me); // exactly 1 event each
+    return NULL;
+}
 static void *churn_reader(void *arg) {
     (void)arg;
     uint64_t sum = 0;
@@ -105,5 +120,26 @@ int main(void) {
     CHECK_EQ(st.watches_live, 0);
     printf("     (%d accesses caught during 3000 arm/disarm cycles with 4 threads running)\n", mt_count());
     free(churn_obj);
+
+    mt_reset();
+    probe_obj = tagwatch_alloc_watched(4 * 8, "probe");
+    void *unmapped = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    munmap(unmapped, 16384);
+    pthread_t pr[4];
+    for (long i = 0; i < 4; i++) pthread_create(&pr[i], NULL, probe_reader, (void *)i);
+    int refused = 0, attempts = 0;
+    while (mt_count() < 4 * PROBE_ITERS && attempts < 2000000) {
+        attempts++;
+        if (tagwatch_watch(&g_untaggable[1], 8, "untaggable") == -TAGWATCH_ENOTTAGGED) refused++;
+        if (tagwatch_watch(unmapped, 16, "unmapped") == -TAGWATCH_ENOTTAGGED) refused++;
+    }
+    for (int i = 0; i < 4; i++) pthread_join(pr[i], NULL);
+    CHECK_EQ(refused, 2 * attempts);
+    CHECK_EQ(mt_count(), 4 * PROBE_ITERS); // still exactly once each, despite the retries
+    tagwatch_get_stats(&st);
+    CHECK_EQ(st.violations, 0);
+    printf("     (%d refused arms of untaggable or unmapped memory while 4 threads trapped %d times)\n", refused,
+           mt_count());
+    free(probe_obj);
     return mt_done();
 }

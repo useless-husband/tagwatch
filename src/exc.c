@@ -287,7 +287,6 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
         return KERN_SUCCESS;
     }
 
-    atomic_fetch_add(&tw_rt.n_traps, 1);
     uint64_t far = (uint64_t)rq->code[1] & TW_ADDR_MASK;
     uint32_t insn = *(const uint32_t *)(uintptr_t)pc;
     tw_insn d;
@@ -314,7 +313,10 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
     tw_watch w;
     uint64_t slack = 0;
     unsigned tag_now = 0;
-    if (!tw_watch_hit(ea, size, far, access, &w, &slack, &tag_now)) {
+    int found = tw_watch_hit_handler(ea, size, far, access, &w, &slack, &tag_now);
+    if (found < 0) return KERN_SUCCESS; // watch lock busy: the thread faults again (see watch.c)
+    atomic_fetch_add(&tw_rt.n_traps, 1);
+    if (!found) {
         // Not a watched granule. If the pointer's tag matches the granule now,
         // the watch was removed while this fault was in flight: just retry.
         // The retry is bounded in case the reported address is not the granule
@@ -336,6 +338,19 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
     }
 
     ti->retries = 0;
+    // The slot comes first: an access that cannot be let through is not
+    // reported, it is retried once the watch is gone.
+    int is_far = 0;
+    uint64_t slot = 0;
+    if (!d.excl) {
+        slot = tw_tramp_get(pc, insn, &is_far);
+        if (!slot) {
+            if (tw_watch_remove_addr_handler(w.gbase, "no-slot") == 0)
+                tw_emit_note("error", "cannot allocate an execution slot; the watch on this object is removed");
+            return KERN_SUCCESS; // retry the instruction, now unwatched (or, lock busy, the same fault again)
+        }
+    }
+
     unsigned flags = 0;
     if (slack || !(access & w.mode)) atomic_fetch_add(&tw_rt.n_filtered, 1);
     else {
@@ -348,13 +363,6 @@ static kern_return_t handle(const request_t *rq, arm_thread_state64_t *ns) {
         emulate_exclusive(&d, ea, ti, ns);
         ns->__pc += 4;
         return KERN_SUCCESS;
-    }
-    int is_far = 0;
-    uint64_t slot = tw_tramp_get(pc, insn, &is_far);
-    if (!slot) {
-        tw_emit_note("error", "cannot allocate an execution slot; the watch on this object is removed");
-        tw_watch_remove_addr(w.gbase, "no-slot");
-        return KERN_SUCCESS; // retry the instruction, now unwatched
     }
     if (is_far) atomic_fetch_add(&tw_rt.n_far, 1);
     ns->__pc = slot;
