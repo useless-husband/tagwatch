@@ -11,10 +11,8 @@ int tw_test_global_a[10] = {1};
 int tw_test_global_b = 2;
 static volatile int sink;
 
-// ASan's stack redzones around buf change the prologue and with it the
-// compact-unwind encoding (DWARF instead of a plain frame record).
-__attribute__((noinline, no_sanitize("undefined", "address"))) int tw_test_with_frame(int x);
-__attribute__((noinline, no_sanitize("undefined", "address"))) int tw_test_with_frame(int x) {
+__attribute__((noinline)) int tw_test_with_frame(int x);
+__attribute__((noinline)) int tw_test_with_frame(int x) {
     char buf[64];
     snprintf(buf, sizeof buf, "%d", x); // a call forces a frame record
     return buf[0];
@@ -88,7 +86,15 @@ int main(void) {
 
     // Compact unwind: a function that calls others keeps a frame record; a
     // leaf does not, so its caller is only found through x30.
+#if defined(__has_feature) && __has_feature(address_sanitizer)
+    // Built with ASan, the linker describes framed functions with DWARF
+    // unwind info instead of a compact frame-record entry (seen on GitHub's
+    // macOS runners); either way it is not mistaken for a leaf.
+    int wf = tw_unwind_mode((uint64_t)(uintptr_t)tw_test_with_frame + 8);
+    CHECK(wf == TW_UNW_FRAME || wf == TW_UNW_DWARF);
+#else
     CHECK_EQ(tw_unwind_mode((uint64_t)(uintptr_t)tw_test_with_frame + 8), TW_UNW_FRAME);
+#endif
     int leaf = tw_unwind_mode((uint64_t)(uintptr_t)tw_test_leaf);
     CHECK(leaf == TW_UNW_FRAMELESS || leaf == TW_UNW_NONE);
     CHECK_EQ(tw_unwind_mode(0x10), TW_UNW_UNKNOWN);
